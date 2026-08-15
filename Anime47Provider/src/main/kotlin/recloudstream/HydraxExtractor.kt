@@ -442,10 +442,11 @@ object HydraxInterceptor : Interceptor {
     ) : Source {
 
         companion object {
-            // DEBUG TẠM THỜI: chỉ quét N byte đầu mỗi segment thay vì toàn bộ 2MB,
-            // đủ để bắt các box/header MP4 điển hình (moov/mdat/stco/co64 thường nằm
-            // gần đầu segment liên quan) mà không tốn CPU quét hết mỗi fragment.
-            private const val DEBUG_SCAN_LIMIT = 65536 // 64 KB
+            // DEBUG TẠM THỜI: log thật cho thấy box 'moov' (chứa bảng offset stco/co64 mà
+            // player dùng để seek) có kích thước ~426KB, vượt xa 64KB ban đầu — mở rộng
+            // giới hạn quét để bắt trọn vùng này, đây là nơi khả năng cao chứa nguồn gốc
+            // offset lỗi 2222032263 (player lấy offset từ 1 entry trong stco/co64).
+            private const val DEBUG_SCAN_LIMIT = 524288 // 512 KB, đủ trùm moov box quan sát được (~426KB)
         }
 
         private var currentPos = startByte
@@ -508,36 +509,92 @@ object HydraxInterceptor : Interceptor {
             val headHex = bytes.take(64).joinToString(" ") { "%02x".format(it) }
             Log.d(TAG, "DEBUG segIndex=$index size=${bytes.size} head64=[$headHex]")
 
-            // Quét từng cửa sổ 4-byte (big-endian) tìm giá trị đáng ngờ:
-            // - giá trị >= totalSize (không thể là 1 offset/size hợp lệ trong file)
-            // - hoặc khớp/gần khớp con số lỗi đã thấy trong log thật (2222032263)
-            // GIỚI HẠN: chỉ quét tối đa DEBUG_SCAN_LIMIT byte đầu segment, không quét cả
-            // 2MB — quét toàn bộ mỗi segment sẽ tốn CPU đáng kể trên mỗi lần fetch và có
-            // thể làm trễ playback đủ để tự gây ra timeout/lỗi khác, làm nhiễu kết quả debug.
+            // Chỉ segment đầu tiên (index=0) chứa ftyp/moov ở đầu file theo log thật đã
+            // thấy — parse có cấu trúc thay vì quét thô 4-byte trượt, để tìm chính xác
+            // box 'stco' (32-bit chunk offsets) / 'co64' (64-bit) bên trong 'moov', vì đó
+            // là nơi player lấy offset byte để seek. In toàn bộ giá trị trong bảng đó.
+            if (index == 0) {
+                debugParseMp4Boxes(bytes)
+            }
+        }
+
+        // DEBUG TẠM THỜI: parse box MP4 dạng cây (size + fourcc) đệ quy vào các container
+        // box (moov/trak/mdia/minf/stbl) để tìm 'stco'/'co64' và in ra bảng chunk offset.
+        private fun debugParseMp4Boxes(bytes: ByteArray, baseOffset: Long = 0L, depth: Int = 0) {
+            val containerTypes = setOf("moov", "trak", "mdia", "minf", "stbl", "udta", "edts")
+            var pos = 0
+            val indent = "  ".repeat(depth)
+            while (pos + 8 <= bytes.size) {
+                val size = readU32(bytes, pos)
+                if (size < 8) {
+                    // size==0 (box chạy tới hết file) hoặc size==1 (largesize 64-bit theo
+                    // sau) hoặc box hỏng -> dừng parse an toàn, không cố đoán thêm.
+                    Log.d(TAG, "DEBUG${depth}: dừng parse tại pos=$pos, size=$size bất thường (0/1/hỏng)")
+                    break
+                }
+                if (pos + 4 + 4 > bytes.size) break
+                val type = String(bytes, pos + 4, 4, Charsets.US_ASCII)
+                val absOffset = baseOffset + pos
+                Log.d(TAG, "$indent DEBUG box type='$type' size=$size fileOffset=$absOffset")
+
+                if (type in containerTypes && pos + size <= bytes.size) {
+                    debugParseMp4Boxes(bytes.copyOfRange(pos + 8, pos + size), absOffset + 8, depth + 1)
+                } else if (type == "stco" && pos + size <= bytes.size) {
+                    debugDumpStco(bytes, pos, size, absOffset, is64 = false)
+                } else if (type == "co64" && pos + size <= bytes.size) {
+                    debugDumpStco(bytes, pos, size, absOffset, is64 = true)
+                }
+
+                if (pos + size <= pos) break // an toàn chống vòng lặp vô hạn nếu size bất thường
+                pos += size
+            }
+        }
+
+        // DEBUG TẠM THỜI: in ra toàn bộ (hoặc tối đa 500 entry đầu) bảng chunk offset,
+        // đánh dấu bất kỳ entry nào >= totalSize hoặc gần khớp offset lỗi đã biết.
+        private fun debugDumpStco(bytes: ByteArray, boxStart: Int, boxSize: Int, absBoxOffset: Long, is64: Boolean) {
+            // Header box 'stco'/'co64': 4 size + 4 type + 1 version + 3 flags + 4 entry_count = 16 byte
+            if (boxStart + 16 > bytes.size) return
+            val entryCount = readU32(bytes, boxStart + 12)
+            Log.w(TAG, "DEBUG TÌM THẤY ${if (is64) "co64" else "stco"} tại fileOffset=$absBoxOffset entryCount=$entryCount boxSize=$boxSize")
+
+            val entrySize = if (is64) 8 else 4
+            var entryPos = boxStart + 16
+            val maxEntries = minOf(entryCount, 500)
             val suspiciousTarget = 2222032263L
-            val scanLimit = minOf(bytes.size - 3, DEBUG_SCAN_LIMIT)
             var i = 0
-            var hits = 0
-            while (i < scanLimit && hits < 20) {
-                val v = ((bytes[i].toLong() and 0xFF) shl 24) or
-                        ((bytes[i + 1].toLong() and 0xFF) shl 16) or
-                        ((bytes[i + 2].toLong() and 0xFF) shl 8) or
-                        (bytes[i + 3].toLong() and 0xFF)
-                val closeToTarget = kotlin.math.abs(v - suspiciousTarget) < 1000L
-                if (v >= totalSize || closeToTarget) {
-                    val byteOffsetInFile = index.toLong() * FRAGMENT_SIZE + i
+            while (i < maxEntries && entryPos + entrySize <= bytes.size) {
+                val value = if (is64) readU64(bytes, entryPos) else readU32(bytes, entryPos)
+                val flaggedTooBig = value >= totalSize
+                val flaggedClose = kotlin.math.abs(value - suspiciousTarget) < 1000L
+                if (flaggedTooBig || flaggedClose) {
                     Log.w(
                         TAG,
-                        "DEBUG NGHI VẤN segIndex=$index localOffset=$i fileOffset=$byteOffsetInFile " +
-                            "value=$v (0x${v.toString(16)}) totalSize=$totalSize closeToKnownBadOffset=$closeToTarget"
+                        "DEBUG NGHI VẤN stco/co64 entry[$i] value=$value (0x${value.toString(16)}) " +
+                            "totalSize=$totalSize tooBig=$flaggedTooBig closeToKnownBadOffset=$flaggedClose"
                     )
-                    hits++
+                } else if (i < 10) {
+                    // luôn in 10 entry đầu để có ngữ cảnh, kể cả khi hợp lệ
+                    Log.d(TAG, "DEBUG stco/co64 entry[$i] value=$value (hợp lệ, < totalSize)")
                 }
+                entryPos += entrySize
                 i++
             }
-            if (hits == 0) {
-                Log.d(TAG, "DEBUG segIndex=$index không tìm thấy giá trị 4-byte nào bất thường trong $scanLimit byte đầu segment")
+        }
+
+        private fun readU32(bytes: ByteArray, pos: Int): Long {
+            return ((bytes[pos].toLong() and 0xFF) shl 24) or
+                    ((bytes[pos + 1].toLong() and 0xFF) shl 16) or
+                    ((bytes[pos + 2].toLong() and 0xFF) shl 8) or
+                    (bytes[pos + 3].toLong() and 0xFF)
+        }
+
+        private fun readU64(bytes: ByteArray, pos: Int): Long {
+            var result = 0L
+            for (k in 0 until 8) {
+                result = (result shl 8) or (bytes[pos + k].toLong() and 0xFF)
             }
+            return result
         }
 
         private fun tokenFor(path: String): String {
