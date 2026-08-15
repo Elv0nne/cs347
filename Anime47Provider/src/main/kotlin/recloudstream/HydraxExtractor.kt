@@ -51,7 +51,18 @@ object HydraxExtractor {
     const val RELAY_HOST = "hydrax-relay.internal"
     private const val ABYSS_BASE_URL = "https://abysscdn.com"
 
-    private val HY_HOSTS = listOf("abysscdn.com", "playhydrax.com", "zplayer.io", "short.ink")
+    // SỬA LỖI (nhận diện host lỗi thời): domain embed Abyss đã đổi từ abysscdn.com
+    // sang abyssplayer.com, và short.ink sang short.icu (xác nhận qua log thực tế:
+    // "https://abyssplayer.com/xxx" và "https://short.icu/xxx" đều bị isHydraxUrl()
+    // trả về false, khiến link HY bị xử lý nhầm thành URL m3u8 trực tiếp thay vì đi
+    // qua HydraxExtractor.getLinks() -> player nhận trang embed HTML thay vì file
+    // media thật, không phát được). Giữ lại domain cũ phòng trường hợp vẫn dùng song
+    // song, chỉ bổ sung domain mới.
+    private val HY_HOSTS = listOf(
+        "abysscdn.com", "abyssplayer.com",
+        "playhydrax.com", "zplayer.io",
+        "short.ink", "short.icu"
+    )
 
     fun isHydraxUrl(url: String): Boolean {
         val host = runCatching { URI(url).host }.getOrNull()
@@ -144,7 +155,12 @@ object HydraxExtractor {
             Log.d(TAG, "getVideoId: không parse được host của url=$url, fallback trả về chính url")
         }
         val result = when {
-            host.contains("short.ink") -> url.substringAfterLast("/")
+            // SỬA LỖI: abyssplayer.com (domain mới thay abysscdn.com) trả videoId ngay
+            // trong path (vd. "https://abyssplayer.com/opymqxBrtY"), không phải qua
+            // query "?v=..." như abysscdn.com/playhydrax.com/zplayer.io cũ — cùng dạng
+            // với short.ink/short.icu. Xác nhận qua log thực tế.
+            host.contains("short.ink") || host.contains("short.icu") || host.contains("abyssplayer.com") ->
+                url.substringAfterLast("/")
             host.contains("abysscdn.com") || host.contains("playhydrax.com") || host.contains("zplayer.io") ->
                 runCatching {
                     URI(url).query?.split("&")
