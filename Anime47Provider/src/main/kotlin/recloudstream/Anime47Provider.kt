@@ -908,6 +908,27 @@ class Anime47Provider : MainAPI() {
         // thay vì chỉ giới hạn ở "FE"/jwplayer.
         Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận diện là FE/khác (không phải HY), xử lý như m3u8 trực tiếp")
 
+        // SỬA LỖI (root cause thật sự — đã xác nhận qua nhiều vòng chẩn đoán): trên
+        // trình duyệt web, tập phim này phát FE bình thường; qua app lại nhận về ảnh
+        // PNG THẬT hợp lệ (không phải trang chặn Cloudflare, không phải segment TS giả
+        // trang — đã loại trừ cả 2 khả năng bằng log chẩn đoán chi tiết) thay vì segment
+        // video mỗi khi tải segment từ CDN "nonprofit.asia". Khác biệt mấu chốt giữa
+        // trình duyệt và app: trình duyệt TỰ ĐỘNG giữ và gửi lại cookie session (thường
+        // do Cloudflare hoặc chính CDN set ở lần request m3u8/embed đầu tiên) cho mọi
+        // request segment tiếp theo, kể cả sang domain CDN khác (nonprofit.asia) nếu
+        // cookie đó có domain/scope phù hợp. Ngược lại, OkHttpClient dùng bởi
+        // getVideoInterceptor() (chạy trong pipeline ExoPlayer) là MỘT INSTANCE HOÀN
+        // TOÀN KHÁC với client nội bộ của app.get() — không chia sẻ CookieJar, nên
+        // cookie nhận được ở bước preflight bên dưới không bao giờ tới được request
+        // segment thật của player. CDN thiếu cookie hợp lệ coi đây là truy cập
+        // hotlink/không hợp lệ và trả về ảnh placeholder (PNG thật, hợp lệ, nhưng không
+        // phải nội dung media) thay vì segment thật. Sửa: đọc header Set-Cookie từ
+        // chính response preflight (m3u8 gốc) và gắn thủ công vào header "Cookie" của
+        // ExtractorLink, để cookie được gửi kèm dưới dạng header tĩnh cho MỌI request
+        // tiếp theo của player (bao gồm cả request tới domain CDN segment khác), bất kể
+        // OkHttpClient nào xử lý request đó.
+        var cookieHeader: String? = null
+
         val headers = mutableMapOf(
             "Referer" to referer,
             "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
@@ -947,9 +968,31 @@ class Anime47Provider : MainAPI() {
             if (!bodyPreview.trimStart().startsWith("#EXTM3U")) {
                 Log.w(TAG, "loadSingleStream: server=${stream.server_name} PREFLIGHT CẢNH BÁO - response KHÔNG bắt đầu bằng '#EXTM3U', có thể không phải m3u8 hợp lệ -> nguy cơ player lỗi 'Cannot find sync byte'")
             }
+
+            // Gom toàn bộ Set-Cookie trả về (có thể nhiều dòng, mỗi dòng 1 cookie) thành
+            // 1 header "Cookie: name1=val1; name2=val2" chuẩn để gửi lại. Dùng
+            // preflight.okhttpResponse (property chuẩn của NiceResponse trong Cloudstream
+            // trỏ tới okhttp3.Response gốc) để chắc chắn có .headers.values("Set-Cookie")
+            // đúng kiểu okhttp3.Headers — tránh phụ thuộc vào wrapper Headers riêng của
+            // Cloudstream (nếu preflight.headers là wrapper, nó có thể không hỗ trợ
+            // values(), chỉ hỗ trợ operator get() trả về 1 giá trị đầu tiên).
+            val setCookies = runCatching {
+                preflight.okhttpResponse.headers.values("Set-Cookie")
+            }.getOrDefault(emptyList())
+            if (setCookies.isNotEmpty()) {
+                cookieHeader = setCookies.joinToString("; ") { it.substringBefore(";") }
+                Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận được ${setCookies.size} Set-Cookie từ preflight -> cookieHeader=$cookieHeader")
+            } else {
+                Log.d(TAG, "loadSingleStream: server=${stream.server_name} preflight KHÔNG có Set-Cookie nào")
+            }
         }, onError = { e ->
             Log.w(TAG, "loadSingleStream: server=${stream.server_name} PREFLIGHT LỖI khi kiểm tra url=$url: ${e.message}")
         })
+
+        if (cookieHeader != null) {
+            headers["Cookie"] = cookieHeader as String
+            Log.d(TAG, "loadSingleStream: server=${stream.server_name} đã gắn header Cookie vào headers cuối cùng gửi cho player: $cookieHeader")
+        }
 
         // SỬA LỖI (structured concurrency + thiếu log lỗi FE): trước đây đoạn này
         // không có try/catch riêng, nên nếu newExtractorLink()/callback() ném lỗi, nó
