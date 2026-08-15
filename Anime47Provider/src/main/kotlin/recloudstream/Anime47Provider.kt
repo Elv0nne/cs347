@@ -1002,6 +1002,16 @@ class Anime47Provider : MainAPI() {
             val response = chain.proceed(request)
             val requestUrl = request.url.toString()
 
+            // CHẨN ĐOÁN (log tổng quát): trước đây interceptor chỉ log khi request khớp
+            // cdnFixRegex (domain "nonprofit.asia"), nên nếu segment video thật sự nằm
+            // trên MỘT DOMAIN KHÁC (vd. chính pl.vlogphim.net khi resolve URL tương đối
+            // "/m3u8/<hash>/<token>" từ master playlist), request đó lọt qua hoàn toàn
+            // không để lại log nào — trông như "im lặng" dù player vẫn đang gọi mạng thật.
+            // Log 1 dòng ngắn cho MỌI request đi qua interceptor này (không lọc domain)
+            // để luôn thấy được domain/host thật ExoPlayer đang gọi khi phát, tách biệt
+            // khỏi khối xử lý "fix" bên dưới (vẫn chỉ chạy cho nonprofit.asia như cũ).
+            Log.d(TAG, "getVideoInterceptor: request qua đây -> host=${request.url.host} path=${request.url.encodedPath} HTTP code=${response.code} Content-Type=${response.header("Content-Type")}")
+
             // SỬA LỖI (log nhiễu bởi ảnh poster): domain nonprofit.asia được CDN dùng
             // chung cho CẢ ảnh poster/thumbnail (path "/img/...") LẪN segment video thật.
             // Log thực tế cho thấy nhiều request "/img/..." bị match nhầm bởi cdnFixRegex
