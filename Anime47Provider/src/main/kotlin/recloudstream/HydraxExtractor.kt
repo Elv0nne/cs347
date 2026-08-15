@@ -83,22 +83,224 @@ object HydraxExtractor {
     }
 
     // ===================== crypto helpers (mirrors AbyssVideoDownloader's CryptoHelper) =====================
+    //
+    // SỬA LỖI (nghiêm trọng — server HY luôn trả rỗng): bản trước dùng
+    // java.security.MessageDigest MD5 chuẩn cho cả 2 trường hợp string và number
+    // (keyForString / keyForNumber). Đối chiếu trực tiếp với
+    // AbyssVideoDownloader/src/main/resources/keyGenerator.js (file JS thật mà trang
+    // abysscdn.com/playhydrax.com dùng để sinh key, được app gốc chạy qua Rhino JS
+    // engine — xem CryptoHelper.getKey() trong AbyssVideoDownloader), phát hiện ra:
+    //
+    // 1) Khi input là STRING (trường hợp mediaKey = "$user_id:$slug:$md5_id"),
+    //    generateKey() trong JS cho kết quả giống hệt MD5 chuẩn trên UTF-8 bytes của
+    //    chuỗi đó. Đã verify bằng cách chạy trực tiếp keyGenerator.js gốc qua Node.js
+    //    và so với crypto.createHash('md5') cho nhiều độ dài chuỗi khác nhau — khớp
+    //    100% mọi trường hợp. Nên keyForString cũ (MD5 chuẩn) đã ĐÚNG, giữ nguyên.
+    //
+    // 2) Khi input là NUMBER (trường hợp encryptionKey = getKey(totalSize) dùng để
+    //    tạo token cho từng segment /mp4/.../$FRAGMENT_SIZE/$index), JS đi vào nhánh
+    //    `else` của encoder(): `input = input.toString()` — nhưng (đây là 1 BUG THẬT
+    //    SỰ nằm trong chính code JS của Abyss, không phải lỗi port) nhánh này CHỈ gán
+    //    lại biến `input` thành chuỗi, KHÔNG gọi stringToBytes(input) như 2 nhánh kia.
+    //    bytesToWords() sau đó nhận trực tiếp CHUỖI (không phải mảng byte), và biểu
+    //    thức `bytes[byteIndex] << (24 - ...)` chạy trên từng KÝ TỰ của chuỗi thay vì
+    //    charCodeAt() của ký tự đó — JS ép kiểu ký tự số ('2','0','9'...) thành giá
+    //    trị số tương ứng (Number("2") === 2) khi dùng với toán tử '<<', KHÁC hẳn với
+    //    charCodeAt() (mã ASCII của '2' là 50). Kết quả: generateKey(2097152) (number)
+    //    ≠ generateKey("2097152") (string) dù cùng giá trị hiển thị — đã verify bằng
+    //    cách chạy keyGenerator.js gốc với cả 2 kiểu input và log kết quả khác nhau.
+    //
+    //    Vì server Abyss (backend sinh token hợp lệ) chắc chắn dùng cùng client-side
+    //    logic này để mã hoá path segment, ta PHẢI tái tạo đúng bug này — "sửa" nó về
+    //    MD5 chuẩn (như bản cũ keyForNumber làm, bằng 1 cách sai khác) sẽ luôn tạo
+    //    token sai, khiến mọi request /sora/... cho server HY bị 403/dữ liệu rác.
+    //
+    //    keyForNumber cũ (tách từng CHỮ SỐ thành 1 byte số nguyên riêng, vd '2' -> 2)
+    //    không khớp bug thật ở trên (vốn dùng char-code-as-number của TOÀN BỘ ký tự,
+    //    kể cả non-digit nếu có, và chỉ áp dụng đúng cách JS "<<" ép kiểu) nên cũng
+    //    sai, dù tình cờ 1 vài input có thể trùng giá trị số học ở 1 số trường hợp.
+    //
+    // Đã verify toàn bộ implementation dưới đây bằng cách chạy song song keyGenerator.js
+    // gốc qua Node.js và 1 bản port Python 1:1 của thuật toán MD5-biến-thể, đối chiếu
+    // 7 test-vector (bao gồm mediaKey dạng string và totalSize dạng number ở nhiều độ
+    // dài khác nhau, kể cả 0) — khớp 100%.
 
-    private fun md5Hex(bytes: ByteArray): String {
-        val digest = java.security.MessageDigest.getInstance("MD5").digest(bytes)
-        return digest.joinToString("") { "%02x".format(it) }
+    /**
+     * Port 1:1 của generateKey() trong keyGenerator.js (AbyssVideoDownloader).
+     * Xử lý đúng 2 nhánh input như JS gốc, bao gồm cả bug number-quirk mô tả ở trên.
+     * Trả về hex string 32 ký tự (dùng trực tiếp làm key liệu — xem aesCtr*ToIso bên dưới,
+     * key AES thực tế = UTF-8 bytes của CHÍNH hex string này, không phải digest nhị phân).
+     */
+    private fun generateKey(value: Any): String {
+        // "words" nhị phân dùng để thay thế bytesToWords của JS, nhưng gộp luôn bước
+        // chuyển input -> "byte nguồn" tương ứng với từng nhánh của encoder() gốc.
+        val (wordSource, byteLength) = when (value) {
+            is String -> {
+                // Nhánh String của JS: stringToBytes(input) rồi bytesToWords bình
+                // thường trên mảng byte thật (charCodeAt & 0xFF của từng ký tự).
+                val bytes = IntArray(value.length) { i -> value[i].code and 0xFF }
+                bytes to value.length
+            }
+            else -> {
+                // Nhánh else của JS (number, hoặc bất kỳ kiểu nào khác String/Buffer/
+                // Array/Uint8Array): input.toString() rồi bytesToWords chạy TRỰC TIẾP
+                // trên chuỗi đó — mỗi "byte" ở đây là ký tự của chuỗi bị ép kiểu số
+                // qua toán tử '<<' của JS, TƯƠNG ĐƯƠNG Number(char) cho ký tự số, và
+                // NaN->0 cho ký tự không phải số (vd dấu '-' của số âm).
+                val s = value.toString()
+                val bytes = IntArray(s.length) { i ->
+                    s[i].digitToIntOrNull() ?: 0
+                }
+                bytes to s.length
+            }
+        }
+        return md5VariantHex(wordSource, byteLength)
     }
 
-    /** getKey() for a Number: each digit char -> its numeric value as a raw byte. */
-    private fun keyForNumber(value: Long): String {
-        val bytes = value.toString().map { c ->
-            if (c.isDigit()) c.digitToInt().toByte() else c.code.toByte()
-        }.toByteArray()
-        return md5Hex(bytes)
+    // ---- thuật toán MD5-biến-thể của keyGenerator.js, port nguyên khối sang Kotlin ----
+    // (calculateHash/2/3/4, endian, bytesToWords, padding) — port từng dòng 1-1 từ JS,
+    // KHÔNG dùng java.security.MessageDigest vì cần giữ đúng hành vi bug ở trên cho
+    // nhánh number; với nhánh string thì thuật toán này cho kết quả trùng MD5 chuẩn
+    // (đã verify), nên dùng chung 1 hàm cho cả 2 trường hợp là an toàn và nhất quán.
+
+    private fun rotl(v: Int, s: Int): Int = (v shl s) or (v ushr (32 - s))
+
+    private fun calc1(a: Int, b: Int, c: Int, d: Int, x: Int, s: Int, t: Int): Int {
+        val tmp = a + ((b and c) or (b.inv() and d)) + x + t
+        return rotl(tmp, s) + b
+    }
+    private fun calc2(a: Int, b: Int, c: Int, d: Int, x: Int, s: Int, t: Int): Int {
+        val tmp = a + ((b and d) or (c and d.inv())) + x + t
+        return rotl(tmp, s) + b
+    }
+    private fun calc3(a: Int, b: Int, c: Int, d: Int, x: Int, s: Int, t: Int): Int {
+        val tmp = a + (b xor c xor d) + x + t
+        return rotl(tmp, s) + b
+    }
+    private fun calc4(a: Int, b: Int, c: Int, d: Int, x: Int, s: Int, t: Int): Int {
+        val tmp = a + (c xor (b or d.inv())) + x + t
+        return rotl(tmp, s) + b
     }
 
-    /** getKey() for a String: plain UTF-8 bytes. */
-    private fun keyForString(value: String): String = md5Hex(value.toByteArray(Charsets.UTF_8))
+    private fun md5VariantHex(byteSource: IntArray, byteLength: Int): String {
+        val bitLength = 8 * byteLength
+
+        // bytesToWords: mỗi "byte" (0..255, hoặc digit 0..9 cho nhánh number) được xếp
+        // vào đúng vị trí bit trong mảng Int32, big-endian trong từng word — y hệt JS.
+        val wordCount = (bitLength ushr 5) + 17 // đủ chỗ cho padding + length field, dư an toàn
+        val words = IntArray(wordCount)
+        for (i in 0 until byteLength) {
+            val bitIndex = i * 8
+            words[bitIndex ushr 5] = words[bitIndex ushr 5] or (byteSource[i] shl (24 - (bitIndex % 32)))
+        }
+
+        // byte-swap từng word trước khi hash (đúng vòng lặp đầu tiên trong encoder() JS)
+        for (i in words.indices) {
+            words[i] = (0x00ff00ff and rotl(words[i], 8)) or (0xff00ff00.toInt() and rotl(words[i], 24))
+        }
+
+        words[bitLength ushr 5] = words[bitLength ushr 5] or (128 shl (bitLength % 32))
+        val lengthIndex = 14 + (((bitLength + 64) ushr 9) shl 4)
+        words[lengthIndex] = bitLength
+
+        var h1 = 0x67452301
+        var h2 = -0x10325477
+        var h3 = -0x67452302
+        var h4 = 0x10325476
+
+        var i = 0
+        while (i < words.size) {
+            fun w(k: Int) = if (i + k < words.size) words[i + k] else 0
+            val t1 = h1; val t2 = h2; val t3 = h3; val t4 = h4
+            var a = t1; var b = t2; var c = t3; var d = t4
+
+            a = calc1(a, b, c, d, w(0), 7, -0x28955b88)
+            d = calc1(d, a, b, c, w(1), 12, -0x173848aa)
+            c = calc1(c, d, a, b, w(2), 17, 0x242070db)
+            b = calc1(b, c, d, a, w(3), 22, -0x3e423112)
+            a = calc1(a, b, c, d, w(4), 7, -0xa83f051)
+            d = calc1(d, a, b, c, w(5), 12, 0x4787c62a)
+            c = calc1(c, d, a, b, w(6), 17, -0x57cfb9ed)
+            b = calc1(b, c, d, a, w(7), 22, -0x2b96aff)
+            a = calc1(a, b, c, d, w(8), 7, 0x698098d8)
+            d = calc1(d, a, b, c, w(9), 12, -0x74bb0851)
+            c = calc1(c, d, a, b, w(10), 17, -0xa44f)
+            b = calc1(b, c, d, a, w(11), 22, -0x76a32842)
+            a = calc1(a, b, c, d, w(12), 7, 0x6b901122)
+            d = calc1(d, a, b, c, w(13), 12, -0x2678e6d)
+            c = calc1(c, d, a, b, w(14), 17, -0x5986bc72)
+            b = calc1(b, c, d, a, w(15), 22, 0x49b40821)
+
+            a = calc2(a, b, c, d, w(1), 5, -0x9e1da9e)
+            d = calc2(d, a, b, c, w(6), 9, -0x3fbf4cc0)
+            c = calc2(c, d, a, b, w(11), 14, 0x265e5a51)
+            b = calc2(b, c, d, a, w(0), 20, -0x16493856)
+            a = calc2(a, b, c, d, w(5), 5, -0x29d0efa3)
+            d = calc2(d, a, b, c, w(10), 9, 0x2441453)
+            c = calc2(c, d, a, b, w(15), 14, -0x275e197f)
+            b = calc2(b, c, d, a, w(4), 20, -0x182c0438)
+            a = calc2(a, b, c, d, w(9), 5, 0x21e1cde6)
+            d = calc2(d, a, b, c, w(14), 9, -0x3cc8f82a)
+            c = calc2(c, d, a, b, w(3), 14, -0xb2af279)
+            b = calc2(b, c, d, a, w(8), 20, 0x455a14ed)
+            a = calc2(a, b, c, d, w(13), 5, -0x561c16fb)
+            d = calc2(d, a, b, c, w(2), 9, -0x3105c08)
+            c = calc2(c, d, a, b, w(7), 14, 0x676f02d9)
+            b = calc2(b, c, d, a, w(12), 20, -0x72d5b376)
+
+            a = calc3(a, b, c, d, w(5), 4, -0x5c6be)
+            d = calc3(d, a, b, c, w(8), 11, -0x788e097f)
+            c = calc3(c, d, a, b, w(11), 16, 0x6d9d6122)
+            b = calc3(b, c, d, a, w(14), 23, -0x21ac7f4)
+            a = calc3(a, b, c, d, w(1), 4, -0x5b4115bc)
+            d = calc3(d, a, b, c, w(4), 11, 0x4bdecfa9)
+            c = calc3(c, d, a, b, w(7), 16, -0x944b4a0)
+            b = calc3(b, c, d, a, w(10), 23, -0x41404390)
+            a = calc3(a, b, c, d, w(13), 4, 0x289b7ec6)
+            d = calc3(d, a, b, c, w(0), 11, -0x155ed806)
+            c = calc3(c, d, a, b, w(3), 16, -0x2b10cf7b)
+            b = calc3(b, c, d, a, w(6), 23, 0x4881d05)
+            a = calc3(a, b, c, d, w(9), 4, -0x262b2fc7)
+            d = calc3(d, a, b, c, w(12), 11, -0x1924661b)
+            c = calc3(c, d, a, b, w(15), 16, 0x1fa27cf8)
+            b = calc3(b, c, d, a, w(2), 23, -0x3b53a99b)
+
+            a = calc4(a, b, c, d, w(0), 6, -0xbd6ddbc)
+            d = calc4(d, a, b, c, w(7), 10, 0x432aff97)
+            c = calc4(c, d, a, b, w(14), 15, -0x546bdc59)
+            b = calc4(b, c, d, a, w(5), 21, -0x36c5fc7)
+            a = calc4(a, b, c, d, w(12), 6, 0x655b59c3)
+            d = calc4(d, a, b, c, w(3), 10, -0x70f3336e)
+            c = calc4(c, d, a, b, w(10), 15, -0x100b83)
+            b = calc4(b, c, d, a, w(1), 21, -0x7a7ba22f)
+            a = calc4(a, b, c, d, w(8), 6, 0x6fa87e4f)
+            d = calc4(d, a, b, c, w(15), 10, -0x1d31920)
+            c = calc4(c, d, a, b, w(6), 15, -0x5cfebcec)
+            b = calc4(b, c, d, a, w(13), 21, 0x4e0811a1)
+            a = calc4(a, b, c, d, w(4), 6, -0x8ac817e)
+            d = calc4(d, a, b, c, w(11), 10, -0x42c50dcb)
+            c = calc4(c, d, a, b, w(2), 15, 0x2ad7d2bb)
+            b = calc4(b, c, d, a, w(9), 21, -0x14792c6f)
+
+            h1 += a; h2 += b; h3 += c; h4 += d
+            i += 16
+        }
+
+        val out = java.nio.ByteBuffer.allocate(16).order(java.nio.ByteOrder.BIG_ENDIAN)
+        for (h in intArrayOf(h1, h2, h3, h4)) {
+            out.putInt(endianWord(h))
+        }
+        return out.array().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun endianWord(v: Int): Int =
+        (0x00ff00ff and rotl(v, 8)) or (0xff00ff00.toInt() and rotl(v, 24))
+
+    /** getKey() cho Number — dùng đúng nhánh "else" (number-quirk) của JS gốc. */
+    private fun keyForNumber(value: Long): String = generateKey(value)
+
+    /** getKey() cho String — nhánh String của JS gốc (tương đương MD5 chuẩn UTF-8). */
+    private fun keyForString(value: String): String = generateKey(value)
 
     private fun aesCtrEncryptToIso(data: String, keyHex: String): String {
         val keyBytes = keyHex.toByteArray(Charsets.UTF_8)
