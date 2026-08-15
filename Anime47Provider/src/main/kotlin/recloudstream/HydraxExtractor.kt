@@ -481,12 +481,52 @@ object HydraxInterceptor : Interceptor {
                         Log.w(TAG, "fetchSegment: segIndex=$index -> HTTP ${resp.code} không thành công, url=$segUrl")
                         ByteArray(0)
                     } else {
-                        resp.body?.bytes() ?: ByteArray(0)
+                        val bytes = resp.body?.bytes() ?: ByteArray(0)
+                        // DEBUG TẠM THỜI: dump header/hex đầu segment + quét tìm bất kỳ số
+                        // 4-byte big-endian nào trong segment có giá trị lớn bất thường
+                        // (>= totalSize), để xác định xem ExoPlayer có đang đọc nhầm 1 giá
+                        // trị bên trong chính segment MP4 này thành offset seek hay không
+                        // (nghi vấn: field size trong 1 box/atom MP4 bị hỏng/không khớp).
+                        debugDumpSegment(index, bytes)
+                        bytes
                     }
                 }
             }.onFailure { e ->
                 Log.w(TAG, "fetchSegment: segIndex=$index EXCEPTION khi tải segment: ${e.message}")
             }.getOrDefault(ByteArray(0))
+        }
+
+        // DEBUG TẠM THỜI - xóa sau khi tìm ra nguyên nhân offset lỗi 2222032263.
+        private fun debugDumpSegment(index: Int, bytes: ByteArray) {
+            val headHex = bytes.take(64).joinToString(" ") { "%02x".format(it) }
+            Log.d(TAG, "DEBUG segIndex=$index size=${bytes.size} head64=[$headHex]")
+
+            // Quét từng cửa sổ 4-byte (big-endian) tìm giá trị đáng ngờ:
+            // - giá trị >= totalSize (không thể là 1 offset/size hợp lệ trong file)
+            // - hoặc khớp/gần khớp con số lỗi đã thấy trong log thật (2222032263)
+            val suspiciousTarget = 2222032263L
+            var i = 0
+            var hits = 0
+            while (i + 4 <= bytes.size && hits < 20) {
+                val v = ((bytes[i].toLong() and 0xFF) shl 24) or
+                        ((bytes[i + 1].toLong() and 0xFF) shl 16) or
+                        ((bytes[i + 2].toLong() and 0xFF) shl 8) or
+                        (bytes[i + 3].toLong() and 0xFF)
+                val closeToTarget = kotlin.math.abs(v - suspiciousTarget) < 1000L
+                if (v >= totalSize || closeToTarget) {
+                    val byteOffsetInFile = index.toLong() * FRAGMENT_SIZE + i
+                    Log.w(
+                        TAG,
+                        "DEBUG NGHI VẤN segIndex=$index localOffset=$i fileOffset=$byteOffsetInFile " +
+                            "value=$v (0x${v.toString(16)}) totalSize=$totalSize closeToKnownBadOffset=$closeToTarget"
+                    )
+                    hits++
+                }
+                i++
+            }
+            if (hits == 0) {
+                Log.d(TAG, "DEBUG segIndex=$index không tìm thấy giá trị 4-byte nào bất thường trong segment")
+            }
         }
 
         private fun tokenFor(path: String): String {
