@@ -1066,19 +1066,24 @@ class Anime47Provider : MainAPI() {
                 }
             }
 
-            // ĐÍNH CHÍNH (giả thuyết "/img/ giả trang TS" ở bản trước SAI): log thực tế
-            // xác nhận 16 byte đầu của response "/img/..." là 89 50 4E 47 0D 0A 1A 0A
-            // 00 00 00 0D 49 48 44 52 — ĐÚNG magic bytes chuẩn PNG (kèm cả chunk IHDR
-            // ngay sau), không phải MPEG-TS giả trang. Content-Length cũng lớn bất
-            // thường so với 1 segment TS 10s ở bitrate 375kbps (594KB–2.9MB so với ước
-            // tính ~470KB tối đa) — đây LÀ ảnh PNG thật. Việc tìm offset đồng bộ MPEG-TS
-            // trả về -1 là ĐÚNG (không có gì để sửa), không phải bug. Khôi phục lại loại
-            // trừ "/img/" khỏi cdnFixRegex-handling như bản gốc: vấn đề video không phát
-            // được KHÔNG nằm ở interceptor này, mà ở chỗ sub-playlist m3u8 từ
-            // pl.vlogphim.net TỰ LIỆT KÊ một URL ảnh PNG làm #EXTINF segment — tức lỗi
-            // nằm ở nội dung playlist trả về (server nguồn hoặc bước rewrite URL segment
-            // ở phía provider/interceptor khác), cần điều tra tại đó, không phải ở đây.
-            if (!cdnFixRegex.containsMatchIn(requestUrl) || requestUrl.contains("/img/")) {
+            // ĐÍNH CHÍNH LẦN 2 (dựa trên bằng chứng mới nhất): log playlist đầy đủ xác
+            // nhận TOÀN BỘ segment trong sub-playlist — không ngoại lệ, trên MỌI CDN con
+            // (cdn1..cdn6) — đều dùng path "/img/...". Không có bất kỳ segment nào dùng
+            // path khác ("/video/", "/ts/", đuôi .ts...). Điều này cho thấy "/img/" là
+            // QUY ƯỚC PATH THẬT của CDN nonprofit.asia cho segment media (kỹ thuật giấu
+            // định dạng thật để né hotlink/bot), KHÔNG PHẢI dấu hiệu để phân biệt
+            // ảnh-thật-vs-segment-giả như 2 lần sửa trước đã giả định nhầm. Giả thuyết
+            // "PNG thật" trước đó dựa trên việc mở link KHÔNG kèm Referer trên trình
+            // duyệt và thấy trang chặn Cloudflare "Sorry, you have been blocked" — nhưng
+            // trang chặn đó CŨNG trả Content-Type: image/png, nên không thể dùng để kết
+            // luận nội dung thật của response khi app gọi (CÓ Referer/header đầy đủ) là
+            // gì. Khôi phục xử lý cho path "/img/" (bỏ loại trừ) để tìm sync-byte MPEG-TS
+            // như logic gốc — đồng thời thêm log dump nhiều byte + kiểm tra dấu hiệu HTML
+            // (trang chặn) để phân biệt rạch ròi 3 khả năng: (a) segment TS giả trang
+            // PNG hợp lệ -> cắt offset, (b) trang chặn Cloudflare giả dạng PNG -> log rõ
+            // để biết cần xử lý Cloudflare challenge, (c) ảnh PNG thật khác không liên
+            // quan -> giữ nguyên.
+            if (!cdnFixRegex.containsMatchIn(requestUrl)) {
                 return@Interceptor response
             }
 
@@ -1117,7 +1122,38 @@ class Anime47Provider : MainAPI() {
                 val offset = findMpegTsOffset(headerBuffer.readByteArray())
                 Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl đã peek $peekedBytes byte, 16 byte hex đầu=[$peekedHex], offset đồng bộ tìm được=$offset")
                 if (offset <= 0) {
-                    Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl KHÔNG tìm thấy byte đồng bộ MPEG-TS (0x47) trong $peekedBytes byte đầu -> giữ nguyên response, player có thể vẫn báo lỗi 'Cannot find sync byte' nếu response thật sự không phải TS hợp lệ")
+                    // CHẨN ĐOÁN (phân biệt PNG thật/segment giả trang PNG với trang chặn
+                    // Cloudflare): cả 3 loại nội dung đều có thể mang Content-Type:
+                    // image/png và bắt đầu bằng magic bytes PNG hợp lệ (Cloudflare có thể
+                    // trả trang chặn dưới dạng ảnh render sẵn). Không tìm thấy offset
+                    // MPEG-TS ở 16 byte đầu KHÔNG loại trừ khả năng đây là segment giả
+                    // trang PNG thật (payload TS có thể nằm sau một đoạn PNG "vỏ bọc" dài
+                    // hơn cửa sổ peek hiện tại, hoặc bị bọc thêm 1 lớp khác). Thử tìm dấu
+                    // hiệu text của trang chặn Cloudflare ("cloudflare", "blocked",
+                    // "sorry") ở dạng ISO-8859-1 (an toàn cho binary) trong toàn bộ cửa sổ
+                    // đã peek, để phân biệt rõ 2 khả năng còn lại: (a) đây thực sự là
+                    // trang chặn Cloudflare -> cần retry qua CloudflareKiller/WebView;
+                    // (b) đây là ảnh/segment khác không phải TS -> không có gì để sửa.
+                    val fullPeekedBytes = run {
+                        val rediagBuffer = Buffer()
+                        val rediagPeek = source.peek()
+                        var n = 0L
+                        while (n < TS_SYNC_PEEK_BYTES) {
+                            val r = rediagPeek.read(rediagBuffer, TS_SYNC_PEEK_BYTES - n)
+                            if (r == -1L) break
+                            n += r
+                        }
+                        rediagBuffer.readByteArray()
+                    }
+                    val asIso = String(fullPeekedBytes, Charsets.ISO_8859_1)
+                    val looksLikeCloudflareBlock = listOf("cloudflare", "sorry, you have been blocked", "blocked", "<html").any {
+                        asIso.contains(it, ignoreCase = true)
+                    }
+                    if (looksLikeCloudflareBlock) {
+                        Log.e(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl NGHI VẤN đây là TRANG CHẶN CLOUDFLARE giả dạng Content-Type image/png (tìm thấy chuỗi 'cloudflare'/'blocked'/'<html' trong $peekedBytes byte đầu) -> KHÔNG PHẢI segment video thật, cần xử lý challenge Cloudflare thay vì tìm sync-byte")
+                    } else {
+                        Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl KHÔNG tìm thấy byte đồng bộ MPEG-TS (0x47) trong $peekedBytes byte đầu, cũng KHÔNG có dấu hiệu trang chặn Cloudflare -> có thể là ảnh/segment không xác định, giữ nguyên response")
+                    }
                 } else {
                     source.skip(offset.toLong())
                 }
