@@ -924,6 +924,33 @@ class Anime47Provider : MainAPI() {
 
         Log.d(TAG, "loadSingleStream: server=${stream.server_name} headers cuối cùng: $headers")
 
+        // CHẨN ĐOÁN (log thực tế cho thấy ExoPlayer báo "Cannot find sync byte. Most
+        // likely not a Transport Stream" khi phát link FE/vlogphim.net — tức nội dung
+        // server trả về không phải .m3u8/TS thật như code đang giả định qua
+        // ExtractorLinkType.M3U8, nhưng lỗi này chỉ lộ ra bên trong ExoPlayer, ngoài
+        // tầm với của log provider). Gọi thử GET trước khi giao link cho player, chỉ
+        // đọc phần đầu response (không tải hết file/segment lớn) để log HTTP code,
+        // Content-Type, và vài trăm ký tự/byte đầu — đủ để biết url thật sự trả về gì
+        // (m3u8 thật, JSON, HTML lỗi, hay định dạng khác) mà KHÔNG đổi hành vi callback
+        // hiện tại (vẫn gửi link như cũ dù preflight thất bại, vì chưa rõ format thật
+        // để tự ý xử lý khác).
+        catchNonCancellation({
+            val preflight = app.get(
+                url,
+                headers = headers,
+                interceptor = interceptor,
+                timeout = 10000
+            )
+            val contentType = preflight.headers["Content-Type"] ?: preflight.headers["content-type"]
+            val bodyPreview = runCatching { preflight.text.take(200) }.getOrDefault("<không đọc được dạng text, có thể là binary>")
+            Log.d(TAG, "loadSingleStream: server=${stream.server_name} PREFLIGHT url=$url -> HTTP code=${preflight.code} Content-Type=$contentType, 200 ký tự đầu: $bodyPreview")
+            if (!bodyPreview.trimStart().startsWith("#EXTM3U")) {
+                Log.w(TAG, "loadSingleStream: server=${stream.server_name} PREFLIGHT CẢNH BÁO - response KHÔNG bắt đầu bằng '#EXTM3U', có thể không phải m3u8 hợp lệ -> nguy cơ player lỗi 'Cannot find sync byte'")
+            }
+        }, onError = { e ->
+            Log.w(TAG, "loadSingleStream: server=${stream.server_name} PREFLIGHT LỖI khi kiểm tra url=$url: ${e.message}")
+        })
+
         // SỬA LỖI (structured concurrency + thiếu log lỗi FE): trước đây đoạn này
         // không có try/catch riêng, nên nếu newExtractorLink()/callback() ném lỗi, nó
         // bay thẳng lên catchNonCancellation() ở loadEpisodeStreams() và bị gộp chung
