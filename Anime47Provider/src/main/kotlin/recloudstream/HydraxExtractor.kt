@@ -360,7 +360,7 @@ object HydraxExtractor {
     private fun getVideoId(url: String): String? {
         val host = runCatching { URI(url).host }.getOrNull() ?: return url
         return when {
-            host.contains("short.ink") -> url.substringAfterLast("/")
+            host.contains("short.ink") || host.contains("short.icu") -> url.substringAfterLast("/")
             host.contains("abysscdn.com") || host.contains("playhydrax.com") || host.contains("zplayer.io") ->
                 runCatching {
                     URI(url).query?.split("&")
