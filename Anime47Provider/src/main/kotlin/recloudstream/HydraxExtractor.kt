@@ -525,13 +525,16 @@ object HydraxInterceptor : Interceptor {
             var pos = 0
             val indent = "  ".repeat(depth)
             while (pos + 8 <= bytes.size) {
-                val size = readU32(bytes, pos)
-                if (size < 8) {
+                val sizeLong = readU32(bytes, pos)
+                if (sizeLong < 8) {
                     // size==0 (box chạy tới hết file) hoặc size==1 (largesize 64-bit theo
                     // sau) hoặc box hỏng -> dừng parse an toàn, không cố đoán thêm.
-                    Log.d(TAG, "DEBUG${depth}: dừng parse tại pos=$pos, size=$size bất thường (0/1/hỏng)")
+                    Log.d(TAG, "DEBUG${depth}: dừng parse tại pos=$pos, size=$sizeLong bất thường (0/1/hỏng)")
                     break
                 }
+                // readU32 trả Long (để tái dùng cho các phép so sánh 64-bit khác), nhưng
+                // pos/box size trong 1 segment 2MB luôn nằm gọn trong Int -> ép kiểu an toàn.
+                val size = sizeLong.toInt()
                 if (pos + 4 + 4 > bytes.size) break
                 val type = String(bytes, pos + 4, 4, Charsets.US_ASCII)
                 val absOffset = baseOffset + pos
@@ -560,7 +563,10 @@ object HydraxInterceptor : Interceptor {
 
             val entrySize = if (is64) 8 else 4
             var entryPos = boxStart + 16
-            val maxEntries = minOf(entryCount, 500)
+            // entryCount là Long (từ readU32) -> ép rõ về Int để so sánh với biến đếm i
+            // (Int), tránh phụ thuộc suy luận kiểu ngầm của Kotlin (đúng thứ vừa gây lỗi
+            // biên dịch ở debugParseMp4Boxes).
+            val maxEntries = minOf(entryCount, 500L).toInt()
             val suspiciousTarget = 2222032263L
             var i = 0
             while (i < maxEntries && entryPos + entrySize <= bytes.size) {
