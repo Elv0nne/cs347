@@ -355,24 +355,29 @@ class Anime47Provider : MainAPI() {
         if (!forceRefresh) {
             val existing = cachedToken
             if (!existing.isNullOrBlank()) {
+                Log.d(TAG, "ensureToken: dùng token đã cache (forceRefresh=false)")
                 return existing
             }
         }
 
+        Log.d(TAG, "ensureToken: cần lấy token mới (forceRefresh=$forceRefresh), chờ tokenMutex")
         // Mutex tránh trường hợp nhiều coroutine (vd. loadLinks chạy song song cho
         // nhiều episodeId) cùng phát hiện token hết hạn và spam login song song.
         return tokenMutex.withLock {
+            Log.d(TAG, "ensureToken: đã giành được tokenMutex")
             // Sau khi giành được lock, kiểm tra lại: có thể một coroutine khác đã
             // login lại thành công trong lúc chờ, nên không cần login lại lần nữa.
             val existing = cachedToken
             if (!forceRefresh) {
                 if (!existing.isNullOrBlank()) {
+                    Log.d(TAG, "ensureToken: token đã được coroutine khác cập nhật trong lúc chờ lock, dùng luôn")
                     return@withLock existing
                 }
             } else if (!existing.isNullOrBlank() && existing != staleToken) {
                 // Một coroutine khác đã login lại thành công với token mới (khác với
                 // token mà caller này biết là đã hỏng) trong lúc chờ lock -> dùng luôn,
                 // không cần gọi /auth/login thêm lần nữa.
+                Log.d(TAG, "ensureToken: coroutine khác đã login lại thành công với token mới trong lúc chờ lock, bỏ qua login lại")
                 return@withLock existing
             }
 
@@ -380,10 +385,12 @@ class Anime47Provider : MainAPI() {
             val password = prefs?.getString("anime47_password", "") ?: ""
 
             if (email.isBlank() || password.isBlank()) {
+                Log.w(TAG, "ensureToken: DỪNG - chưa cấu hình email/password trong Settings, không thể đăng nhập")
                 return@withLock null
             }
 
             try {
+                Log.d(TAG, "ensureToken: gọi POST $apiBaseUrl/auth/login cho email=$email")
                 val body = toJson(LoginRequest(email, password))
                     .toRequestBody("application/json".toMediaTypeOrNull())
 
@@ -397,6 +404,7 @@ class Anime47Provider : MainAPI() {
                     interceptor = interceptor,
                     timeout = 15000
                 )
+                Log.d(TAG, "ensureToken: /auth/login trả về HTTP code=${response.code} successful=${response.isSuccessful}")
 
                 val loginResponse: LoginResponse = mapper.readValue(
                     response.text,
@@ -405,11 +413,15 @@ class Anime47Provider : MainAPI() {
                 val newToken = loginResponse.access_token
                 if (!newToken.isNullOrBlank()) {
                     cachedToken = newToken
+                    Log.d(TAG, "ensureToken: login THÀNH CÔNG, đã cập nhật cachedToken (độ dài=${newToken.length})")
+                } else {
+                    Log.e(TAG, "ensureToken: THẤT BẠI - /auth/login trả về access_token rỗng/null. Response 300 ký tự đầu: ${response.text.take(300)}")
                 }
                 newToken
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                Log.e(TAG, "ensureToken: THẤT BẠI - exception khi gọi /auth/login: ${e.message}", e)
                 null
             }
         }
@@ -420,6 +432,7 @@ class Anime47Provider : MainAPI() {
         return if (token != null) {
             mapOf("Authorization" to "Bearer $token")
         } else {
+            Log.d(TAG, "getAuthHeaders: không có token khả dụng, trả về headers rỗng (request sẽ đi không kèm Authorization)")
             emptyMap()
         }
     }
@@ -433,13 +446,22 @@ class Anime47Provider : MainAPI() {
     }
 
     private suspend inline fun <reified T> fetchApi(url: String): T {
+        Log.d(TAG, "fetchApi: GET url=$url")
         val headers = getAuthHeaders()
-        val firstResponse = app.get(
-            url,
-            headers = headers,
-            interceptor = interceptor,
-            timeout = 15000
-        )
+        val firstResponse = try {
+            app.get(
+                url,
+                headers = headers,
+                interceptor = interceptor,
+                timeout = 15000
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchApi: THẤT BẠI - lỗi mạng khi GET url=$url: ${e.message}", e)
+            throw e
+        }
+        Log.d(TAG, "fetchApi: url=$url trả về HTTP code=${firstResponse.code} successful=${firstResponse.isSuccessful}")
 
         var text = firstResponse.text
 
@@ -448,6 +470,7 @@ class Anime47Provider : MainAPI() {
         // người dùng tự vào cài đặt đăng nhập lại.
         val looksStale = looksExpiredOrUnauthorized(text) || firstResponse.code == 401
         if (looksStale) {
+            Log.w(TAG, "fetchApi: url=$url phát hiện token hết hạn/không hợp lệ (code=${firstResponse.code}), thử đăng nhập lại rồi retry 1 lần")
             // SỬA LỖI (race condition): không còn "cachedToken = null" ở đây ngoài
             // mutex — thao tác này trước đây có thể vô tình xoá mất token mới mà một
             // coroutine khác vừa login lại thành công (xem ghi chú tại ensureToken()).
@@ -464,20 +487,31 @@ class Anime47Provider : MainAPI() {
             // response gốc (text) là lựa chọn hợp lý duy nhất; looksExpiredOrUnauthorized()
             // bên dưới sẽ bắt lại và báo lỗi rõ ràng cho người dùng trong cả hai trường hợp.
             if (retryHeaders.containsKey("Authorization")) {
-                text = app.get(
+                Log.d(TAG, "fetchApi: retry GET url=$url với token mới")
+                val retryResponse = app.get(
                     url,
                     headers = retryHeaders,
                     interceptor = interceptor,
                     timeout = 15000
-                ).text
+                )
+                Log.d(TAG, "fetchApi: retry url=$url trả về HTTP code=${retryResponse.code} successful=${retryResponse.isSuccessful}")
+                text = retryResponse.text
+            } else {
+                Log.w(TAG, "fetchApi: url=$url không retry được vì không lấy được token mới (chưa đăng nhập hoặc login lại thất bại)")
             }
         }
 
         if (looksExpiredOrUnauthorized(text)) {
+            Log.e(TAG, "fetchApi: DỪNG - url=$url vẫn báo cần đăng nhập sau khi retry. 300 ký tự đầu response: ${text.take(300)}")
             throw ErrorLoadingException("Trang web yêu cầu đăng nhập. Vui lòng mở cài đặt tiện ích để cấu hình tài khoản.")
         }
 
-        return mapper.readValue(text, object : TypeReference<T>() {})
+        return try {
+            mapper.readValue(text, object : TypeReference<T>() {})
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchApi: THẤT BẠI - không parse được JSON từ url=$url: ${e.message}. 300 ký tự đầu response: ${text.take(300)}", e)
+            throw e
+        }
     }
 
     override suspend fun getMainPage(
