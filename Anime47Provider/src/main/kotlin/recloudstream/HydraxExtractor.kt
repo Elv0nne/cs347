@@ -363,9 +363,17 @@ object HydraxInterceptor : Interceptor {
 
         val rangeHeader = request.header("Range")
         val (start, endInclusive) = parseRange(rangeHeader, size)
-        if (start > endInclusive || start < 0) {
+
+        // start có thể lớn hơn totalSize khi player seek quá cuối file (hoặc tính sai offset).
+        // Theo RFC 7233, phải trả 416 kèm Content-Range: bytes */size để player tự điều
+        // chỉnh vị trí seek, thay vì trả lỗi trần trụi khiến playback bị treo/crash.
+        if (start < 0 || start >= size) {
+            Log.e(TAG, "intercept: THẤT BẠI - start nằm ngoài file, start=$start size=$size rangeHeader=$rangeHeader")
+            return errorResponse(request, 416, "Range not satisfiable", size)
+        }
+        if (start > endInclusive) {
             Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
-            return errorResponse(request, 416, "Invalid range")
+            return errorResponse(request, 416, "Invalid range", size)
         }
 
         val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, size, start, endInclusive)
@@ -401,14 +409,25 @@ object HydraxInterceptor : Interceptor {
         return start to minOf(end, totalSize - 1)
     }
 
-    private fun errorResponse(request: Request, code: Int, message: String): Response {
-        return Response.Builder()
+    private fun errorResponse(
+        request: Request,
+        code: Int,
+        message: String,
+        totalSizeForRange: Long? = null
+    ): Response {
+        val builder = Response.Builder()
             .request(request)
             .protocol(Protocol.HTTP_1_1)
             .code(code)
             .message(message)
             .body("".toResponseBody(null))
-            .build()
+        // RFC 7233: một response 416 nên kèm Content-Range: bytes */<size> để client
+        // (ExoPlayer, v.v.) biết kích thước thật của resource và tự sửa lại request seek
+        // tiếp theo, thay vì bị stuck lặp lại cùng một range sai.
+        if (code == 416 && totalSizeForRange != null) {
+            builder.header("Content-Range", "bytes */$totalSizeForRange")
+        }
+        return builder.build()
     }
 
     /** Lazily fetches 2MB Abyss segments as the player consumes bytes, one segment ahead at most. */
