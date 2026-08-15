@@ -1005,7 +1005,13 @@ class Anime47Provider : MainAPI() {
                 return@Interceptor response
             }
 
-            val body = response.body ?: return@Interceptor response
+            Log.d(TAG, "getVideoInterceptor: nonprofit.asia CDN khớp regex, url=${request.url} HTTP code=${response.code} Content-Type=${response.header("Content-Type")} Content-Length=${response.header("Content-Length")}")
+
+            val body = response.body
+            if (body == null) {
+                Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=${request.url} response.body() null, trả nguyên response gốc")
+                return@Interceptor response
+            }
 
             try {
                 // HIỆU NĂNG (real fix): bản trước gọi body.bytes() — tải TOÀN BỘ segment/
@@ -1028,8 +1034,14 @@ class Anime47Provider : MainAPI() {
                     peekedBytes += read
                 }
 
+                val peekedHex = headerBuffer.snapshot().let { snapshot ->
+                    (0 until minOf(16, snapshot.size)).joinToString(" ") { "%02x".format(snapshot[it]) }
+                }
                 val offset = findMpegTsOffset(headerBuffer.readByteArray())
-                if (offset > 0) {
+                Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=${request.url} đã peek $peekedBytes byte, 16 byte hex đầu=[$peekedHex], offset đồng bộ tìm được=$offset")
+                if (offset <= 0) {
+                    Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=${request.url} KHÔNG tìm thấy byte đồng bộ MPEG-TS (0x47) trong $peekedBytes byte đầu -> giữ nguyên response, player có thể vẫn báo lỗi 'Cannot find sync byte' nếu response thật sự không phải TS hợp lệ")
+                } else {
                     source.skip(offset.toLong())
                 }
 
@@ -1057,6 +1069,7 @@ class Anime47Provider : MainAPI() {
             } catch (e: IOException) {
                 // Đọc/skip source thất bại giữa chừng (mạng gián đoạn): trả lỗi gốc cho
                 // player xử lý (retry/next server) thay vì làm crash luồng phát video.
+                Log.e(TAG, "getVideoInterceptor: nonprofit.asia url=${request.url} IOException khi đọc/skip source: ${e.message}", e)
                 response
             }
         }
