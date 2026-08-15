@@ -1,0 +1,23 @@
+[
+    {
+        "iconUrl": "https://anime47.best/favicon.ico",
+        "fileHash": "sha256-889c7bb9a5aa6f2d38abbcc5cd01c6ff33591b983fc16d6fc7aff25253f90f7b",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Elv0nne/cs347",
+        "fileSize": 106987,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "H4RS"
+        ],
+        "tvTypes": [
+            "Anime",
+            "Cartoon"
+        ],
+        "version": 14,
+        "internalName": "Anime47Provider",
+        "description": "Anime47 - Xem anime vietsub/thuy\u1ebft minh",
+        "url": "https://raw.githubusercontent.com/Elv0nne/cs347/builds/Anime47Provider.cs3",
+        "name": "Anime47Provider"
+    }
+]

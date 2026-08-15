@@ -1,0 +1,8 @@
+{
+    "name": "Elvonne",
+    "description": "Anime47",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/Elv0nne/cs347/refs/heads/builds/plugins.json"
+    ]
+}
