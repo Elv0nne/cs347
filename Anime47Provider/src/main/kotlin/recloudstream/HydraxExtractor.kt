@@ -17,6 +17,7 @@ import android.util.Log
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -47,6 +48,15 @@ object HydraxExtractor {
     private const val TAG = "HydraxExtractor"
 
     private val mapper = jacksonObjectMapper()
+
+    // SỬA LỖI (Connection reset khi TLS handshake): log thực tế cho thấy request tới
+    // abyssplayer.com bị "java.net.SocketException: Connection reset" ngay ở bước
+    // ConscryptEngineSocket.doHandshake — tức bị chặn/reset trước khi kịp gửi HTTP
+    // request, đặc trưng của CDN bật Cloudflare/anti-bot chặn theo TLS fingerprint của
+    // client HTTP thuần (không giống trình duyệt thật). CloudflareKiller dùng WebView
+    // thật để vượt qua challenge này, giống cách mọi request khác trong plugin
+    // (Anime47Provider.interceptor) đã làm cho anime47.best.
+    private val cloudflareKiller = CloudflareKiller()
     private const val FRAGMENT_SIZE = 2097152L // 2 MiB, must match server-side chunking
     const val RELAY_HOST = "hydrax-relay.internal"
     // SỬA LỖI (backend đổi domain): abysscdn.com đã ngừng phản hồi (read timeout khi
@@ -196,6 +206,7 @@ object HydraxExtractor {
                 "Referer" to referer,
                 "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
             ),
+            interceptor = cloudflareKiller,
             timeout = 15000
         )
         Log.d(TAG, "fetchMp4Metadata: HTTP code=${response.code} successful=${response.isSuccessful}")
