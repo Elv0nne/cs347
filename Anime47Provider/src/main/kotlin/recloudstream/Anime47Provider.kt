@@ -1,6 +1,7 @@
 package recloudstream
 
 import android.content.SharedPreferences
+import android.util.Log
 import com.fasterxml.jackson.core.type.TypeReference
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -89,6 +90,10 @@ private fun toJson(value: Any?): String {
 }
 
 class Anime47Provider : MainAPI() {
+
+    // TAG dùng để lọc log riêng cho provider này, vd:
+    //   adb logcat -s Anime47Provider:V
+    private val TAG = "Anime47Provider"
 
     override var mainUrl = "https://anime47.best"
     private val apiBaseUrl = "https://anime47.love/api"
@@ -703,6 +708,8 @@ class Anime47Provider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        Log.d(TAG, "loadLinks: BẮT ĐẦU data=$data")
+
         val episodeIds: List<Int> = try {
             if (data.startsWith("[")) {
                 mapper.readValue(data, object : TypeReference<List<Int>>() {})
@@ -710,10 +717,15 @@ class Anime47Provider : MainAPI() {
                 listOf(data.toInt())
             }
         } catch (e: Exception) {
+            Log.e(TAG, "loadLinks: DỪNG - không parse được data='$data' thành episodeId(s): ${e.message}", e)
             return false
         }
 
-        if (episodeIds.isEmpty()) return false
+        Log.d(TAG, "loadLinks: episodeIds=$episodeIds")
+        if (episodeIds.isEmpty()) {
+            Log.w(TAG, "loadLinks: DỪNG - episodeIds rỗng")
+            return false
+        }
 
         val loaded = AtomicBoolean(false)
         val referer = "$mainUrl/"
@@ -752,6 +764,7 @@ class Anime47Provider : MainAPI() {
             }.awaitAll()
         }
 
+        Log.d(TAG, "loadLinks: KẾT THÚC - loaded=${loaded.get()} cho episodeIds=$episodeIds")
         return loaded.get()
     }
 
@@ -771,15 +784,22 @@ class Anime47Provider : MainAPI() {
         // do timeout gửi xuống, khiến coroutine (và bất kỳ awaitAll() con nào bên trong)
         // không dừng đúng lúc như kỳ vọng.
         catchNonCancellation({
+            Log.d(TAG, "loadEpisodeStreams: episodeId=$episodeId gọi watch-info API")
             val watchResponse: ApiWatchResponse? =
                 fetchApi("$apiBaseUrl/anime/watch/episode/$episodeId?lang=vi")
-            val streams = watchResponse?.streams ?: return@catchNonCancellation
+            val streams = watchResponse?.streams
+            if (streams == null) {
+                Log.e(TAG, "loadEpisodeStreams: episodeId=$episodeId DỪNG - watch-info trả về null hoặc không có 'streams' (watchResponse=$watchResponse)")
+                return@catchNonCancellation
+            }
+            Log.d(TAG, "loadEpisodeStreams: episodeId=$episodeId nhận được ${streams.size} stream(s): ${streams.map { it.server_name to it.player_type }}")
 
             val episodeLoaded = coroutineScope {
                 streams.map { stream ->
                     async { loadSingleStream(stream, referer, loaded, subtitleCallback, callback) }
                 }.awaitAll().any { it }
             }
+            Log.d(TAG, "loadEpisodeStreams: episodeId=$episodeId hoàn tất, episodeLoaded=$episodeLoaded")
 
             // Báo "đã xem" lên hệ thống DCC chỉ khi thực sự lấy được ít nhất 1 link
             // phát cho episode này (tránh cộng điểm cho tập lỗi/rỗng).
@@ -792,8 +812,9 @@ class Anime47Provider : MainAPI() {
             if (episodeLoaded) {
                 backgroundScope.launch { markEpisodeWatched(episodeId) }
             }
-        }, onError = {
+        }, onError = { e ->
             // bỏ qua lỗi từng episode riêng lẻ, không chặn các episode khác
+            Log.e(TAG, "loadEpisodeStreams: episodeId=$episodeId LỖI: ${e.message}", e)
         })
     }
 
@@ -805,8 +826,12 @@ class Anime47Provider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val url = stream.url ?: return false
-        if (url.isBlank()) return false
+        val url = stream.url
+        Log.d(TAG, "loadSingleStream: server=${stream.server_name} player_type=${stream.player_type} url=$url")
+        if (url == null || url.isBlank()) {
+            Log.w(TAG, "loadSingleStream: bỏ qua server=${stream.server_name} vì url rỗng/null")
+            return false
+        }
 
         fun forwardSubtitles() {
             stream.subtitles?.forEach { subtitle ->
@@ -820,6 +845,7 @@ class Anime47Provider : MainAPI() {
         // chứa metadata mã hóa AES-CTR (xem HydraxExtractor.kt). Phải đi qua
         // HydraxExtractor + HydraxInterceptor thay vì coi url là m3u8 trực tiếp.
         if (HydraxExtractor.isHydraxUrl(url)) {
+            Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận diện là HY (Hydrax), gọi HydraxExtractor.getLinks")
             // SỬA LỖI (structured concurrency): xem ghi chú tại catchNonCancellation() —
             // giữ nguyên tín hiệu hủy (timeout/sibling lỗi trong awaitAll) thay vì để
             // catch trần nuốt mất, đặc biệt quan trọng vì HydraxExtractor.getLinks() có
@@ -833,8 +859,10 @@ class Anime47Provider : MainAPI() {
                     referer = referer
                 )
                 hydraxLinks.forEach { callback(it) }
+                Log.d(TAG, "loadSingleStream: server=${stream.server_name} HY trả về ${hydraxLinks.size} link")
                 hydraxLinks.isNotEmpty()
-            }, onError = {
+            }, onError = { e ->
+                Log.e(TAG, "loadSingleStream: server=${stream.server_name} HY LỖI: ${e.message}", e)
                 false // bỏ qua lỗi riêng của HY, không chặn các server khác
             })
             if (hyLoaded) loaded.set(true)
@@ -863,6 +891,7 @@ class Anime47Provider : MainAPI() {
             this.quality = Qualities.Unknown.value
         }
 
+        Log.d(TAG, "loadSingleStream: server=${stream.server_name} link M3U8 trực tiếp, gửi callback")
         callback(link)
         loaded.set(true)
         forwardSubtitles()
