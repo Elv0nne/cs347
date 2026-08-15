@@ -363,17 +363,9 @@ object HydraxInterceptor : Interceptor {
 
         val rangeHeader = request.header("Range")
         val (start, endInclusive) = parseRange(rangeHeader, size)
-
-        // start có thể lớn hơn totalSize khi player seek quá cuối file (hoặc tính sai offset).
-        // Theo RFC 7233, phải trả 416 kèm Content-Range: bytes */size để player tự điều
-        // chỉnh vị trí seek, thay vì trả lỗi trần trụi khiến playback bị treo/crash.
-        if (start < 0 || start >= size) {
-            Log.e(TAG, "intercept: THẤT BẠI - start nằm ngoài file, start=$start size=$size rangeHeader=$rangeHeader")
-            return errorResponse(request, 416, "Range not satisfiable", size)
-        }
-        if (start > endInclusive) {
+        if (start > endInclusive || start < 0) {
             Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
-            return errorResponse(request, 416, "Invalid range", size)
+            return errorResponse(request, 416, "Invalid range")
         }
 
         val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, size, start, endInclusive)
@@ -409,25 +401,14 @@ object HydraxInterceptor : Interceptor {
         return start to minOf(end, totalSize - 1)
     }
 
-    private fun errorResponse(
-        request: Request,
-        code: Int,
-        message: String,
-        totalSizeForRange: Long? = null
-    ): Response {
-        val builder = Response.Builder()
+    private fun errorResponse(request: Request, code: Int, message: String): Response {
+        return Response.Builder()
             .request(request)
             .protocol(Protocol.HTTP_1_1)
             .code(code)
             .message(message)
             .body("".toResponseBody(null))
-        // RFC 7233: một response 416 nên kèm Content-Range: bytes */<size> để client
-        // (ExoPlayer, v.v.) biết kích thước thật của resource và tự sửa lại request seek
-        // tiếp theo, thay vì bị stuck lặp lại cùng một range sai.
-        if (code == 416 && totalSizeForRange != null) {
-            builder.header("Content-Range", "bytes */$totalSizeForRange")
-        }
-        return builder.build()
+            .build()
     }
 
     /** Lazily fetches 2MB Abyss segments as the player consumes bytes, one segment ahead at most. */
@@ -440,13 +421,6 @@ object HydraxInterceptor : Interceptor {
         startByte: Long,
         private val endByteInclusive: Long
     ) : Source {
-
-        companion object {
-            // DEBUG TẠM THỜI: chỉ quét N byte đầu mỗi segment thay vì toàn bộ 2MB,
-            // đủ để bắt các box/header MP4 điển hình (moov/mdat/stco/co64 thường nằm
-            // gần đầu segment liên quan) mà không tốn CPU quét hết mỗi fragment.
-            private const val DEBUG_SCAN_LIMIT = 65536 // 64 KB
-        }
 
         private var currentPos = startByte
         private val currentBuffer = Buffer()
@@ -488,56 +462,12 @@ object HydraxInterceptor : Interceptor {
                         Log.w(TAG, "fetchSegment: segIndex=$index -> HTTP ${resp.code} không thành công, url=$segUrl")
                         ByteArray(0)
                     } else {
-                        val bytes = resp.body?.bytes() ?: ByteArray(0)
-                        // DEBUG TẠM THỜI: dump header/hex đầu segment + quét tìm bất kỳ số
-                        // 4-byte big-endian nào trong segment có giá trị lớn bất thường
-                        // (>= totalSize), để xác định xem ExoPlayer có đang đọc nhầm 1 giá
-                        // trị bên trong chính segment MP4 này thành offset seek hay không
-                        // (nghi vấn: field size trong 1 box/atom MP4 bị hỏng/không khớp).
-                        debugDumpSegment(index, bytes)
-                        bytes
+                        resp.body?.bytes() ?: ByteArray(0)
                     }
                 }
             }.onFailure { e ->
                 Log.w(TAG, "fetchSegment: segIndex=$index EXCEPTION khi tải segment: ${e.message}")
             }.getOrDefault(ByteArray(0))
-        }
-
-        // DEBUG TẠM THỜI - xóa sau khi tìm ra nguyên nhân offset lỗi 2222032263.
-        private fun debugDumpSegment(index: Int, bytes: ByteArray) {
-            val headHex = bytes.take(64).joinToString(" ") { "%02x".format(it) }
-            Log.d(TAG, "DEBUG segIndex=$index size=${bytes.size} head64=[$headHex]")
-
-            // Quét từng cửa sổ 4-byte (big-endian) tìm giá trị đáng ngờ:
-            // - giá trị >= totalSize (không thể là 1 offset/size hợp lệ trong file)
-            // - hoặc khớp/gần khớp con số lỗi đã thấy trong log thật (2222032263)
-            // GIỚI HẠN: chỉ quét tối đa DEBUG_SCAN_LIMIT byte đầu segment, không quét cả
-            // 2MB — quét toàn bộ mỗi segment sẽ tốn CPU đáng kể trên mỗi lần fetch và có
-            // thể làm trễ playback đủ để tự gây ra timeout/lỗi khác, làm nhiễu kết quả debug.
-            val suspiciousTarget = 2222032263L
-            val scanLimit = minOf(bytes.size - 3, DEBUG_SCAN_LIMIT)
-            var i = 0
-            var hits = 0
-            while (i < scanLimit && hits < 20) {
-                val v = ((bytes[i].toLong() and 0xFF) shl 24) or
-                        ((bytes[i + 1].toLong() and 0xFF) shl 16) or
-                        ((bytes[i + 2].toLong() and 0xFF) shl 8) or
-                        (bytes[i + 3].toLong() and 0xFF)
-                val closeToTarget = kotlin.math.abs(v - suspiciousTarget) < 1000L
-                if (v >= totalSize || closeToTarget) {
-                    val byteOffsetInFile = index.toLong() * FRAGMENT_SIZE + i
-                    Log.w(
-                        TAG,
-                        "DEBUG NGHI VẤN segIndex=$index localOffset=$i fileOffset=$byteOffsetInFile " +
-                            "value=$v (0x${v.toString(16)}) totalSize=$totalSize closeToKnownBadOffset=$closeToTarget"
-                    )
-                    hits++
-                }
-                i++
-            }
-            if (hits == 0) {
-                Log.d(TAG, "DEBUG segIndex=$index không tìm thấy giá trị 4-byte nào bất thường trong $scanLimit byte đầu segment")
-            }
         }
 
         private fun tokenFor(path: String): String {
