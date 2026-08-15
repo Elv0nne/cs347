@@ -49,7 +49,15 @@ object HydraxExtractor {
     private val mapper = jacksonObjectMapper()
     private const val FRAGMENT_SIZE = 2097152L // 2 MiB, must match server-side chunking
     const val RELAY_HOST = "hydrax-relay.internal"
-    private const val ABYSS_BASE_URL = "https://abysscdn.com"
+    // SỬA LỖI (backend đổi domain): abysscdn.com đã ngừng phản hồi (read timeout khi
+    // gọi thẳng "https://abysscdn.com/?v=..."), khiến fetchMp4Metadata() luôn bị treo
+    // tới khi hết EPISODE_TIMEOUT_MS mà không hề có response (không log được cả lỗi
+    // lẫn HTTP code, vì app.get() chưa từng trả về). Domain hiển thị trong URL nguồn
+    // cũng đã đổi từ abysscdn.com sang abyssplayer.com (xem HY_HOSTS/getVideoId) —
+    // xác nhận trực tiếp: gọi "https://abyssplayer.com/{videoId}" trả về trang embed
+    // hợp lệ (title = tên file mp4), trong khi "https://abysscdn.com/?v={videoId}"
+    // timeout hoàn toàn. Đổi base URL sang domain mới đang hoạt động.
+    private const val ABYSS_BASE_URL = "https://abyssplayer.com"
 
     // SỬA LỖI (nhận diện host lỗi thời): domain embed Abyss đã đổi từ abysscdn.com
     // sang abyssplayer.com, và short.ink sang short.icu (xác nhận qua log thực tế:
@@ -175,7 +183,11 @@ object HydraxExtractor {
     }
 
     private suspend fun fetchMp4Metadata(videoId: String, referer: String): Mp4Data? {
-        val embedUrl = "$ABYSS_BASE_URL/?v=$videoId"
+        // SỬA LỖI: abyssplayer.com dùng dạng path "/videoId" (đã xác nhận hoạt động,
+        // trả về trang embed hợp lệ), KHÔNG phải dạng query "?v=videoId" của
+        // abysscdn.com cũ — dùng nhầm dạng cũ trên domain mới nhiều khả năng vẫn lỗi
+        // (404 hoặc trang không đúng), nên chuyển hẳn sang dạng path đã kiểm chứng.
+        val embedUrl = "$ABYSS_BASE_URL/$videoId"
         Log.d(TAG, "fetchMp4Metadata: videoId=$videoId embedUrl=$embedUrl referer=$referer")
 
         val response = app.get(
