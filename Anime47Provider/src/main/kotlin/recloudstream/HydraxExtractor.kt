@@ -13,6 +13,7 @@ package recloudstream
  * translates player Range requests into the segment-token protocol on the fly.
  */
 
+import android.util.Log
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.app
@@ -41,6 +42,10 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 object HydraxExtractor {
+
+    // TAG dùng để lọc log riêng cho extractor này, vd:
+    //   adb logcat -s HydraxExtractor:V
+    private const val TAG = "HydraxExtractor"
 
     // mapper riêng cho object này: chỉ khởi tạo 1 lần duy nhất khi class được load (Kotlin
     // "object" là singleton), nên chi phí khởi tạo ObjectMapper không lặp lại ở runtime.
@@ -78,8 +83,10 @@ object HydraxExtractor {
     const val HY_EMBED_TIMEOUT_MS = 8000L
 
     fun isHydraxUrl(url: String): Boolean {
-        val host = runCatching { URI(url).host }.getOrNull() ?: return false
-        return HY_HOSTS.any { host.contains(it, ignoreCase = true) }
+        val host = runCatching { URI(url).host }.getOrNull()
+        val result = host != null && HY_HOSTS.any { host.contains(it, ignoreCase = true) }
+        Log.d(TAG, "isHydraxUrl: url=$url host=$host -> $result")
+        return result
     }
 
     // ===================== crypto helpers (mirrors AbyssVideoDownloader's CryptoHelper) =====================
@@ -156,8 +163,10 @@ object HydraxExtractor {
     // ===================== id / metadata extraction =====================
 
     private fun getVideoId(url: String): String? {
-        val host = runCatching { URI(url).host }.getOrNull() ?: return url
-        return when {
+        val host = runCatching { URI(url).host }.getOrNull() ?: return url.also {
+            Log.d(TAG, "getVideoId: không parse được host của url=$url, fallback trả về chính url")
+        }
+        val result = when {
             host.contains("short.ink") -> url.substringAfterLast("/")
             host.contains("abysscdn.com") || host.contains("playhydrax.com") || host.contains("zplayer.io") ->
                 runCatching {
@@ -168,10 +177,13 @@ object HydraxExtractor {
                 }.getOrNull()
             else -> url
         }
+        Log.d(TAG, "getVideoId: url=$url host=$host -> videoId=$result")
+        return result
     }
 
     private suspend fun fetchMp4Metadata(videoId: String, referer: String): Mp4Data? {
         val embedUrl = "$ABYSS_BASE_URL/?v=$videoId"
+        Log.d(TAG, "fetchMp4Metadata: videoId=$videoId embedUrl=$embedUrl referer=$referer")
         val headers = mapOf(
             "Referer" to referer,
             "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
@@ -183,20 +195,32 @@ object HydraxExtractor {
         // thay vì lỗi thật sự từ phía Abyss.
         var response = runCatching {
             app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = HY_EMBED_TIMEOUT_MS)
+        }.onFailure { e ->
+            Log.w(TAG, "fetchMp4Metadata: lần gọi embed đầu tiên ném exception: ${e.message}", e)
         }.getOrNull()
 
+        Log.d(TAG, "fetchMp4Metadata: lần 1 -> code=${response?.code} successful=${response?.isSuccessful}")
+
         if (response == null || !response.isSuccessful) {
+            Log.d(TAG, "fetchMp4Metadata: retry lần 2 do lần 1 thất bại")
             response = runCatching {
                 app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = HY_EMBED_TIMEOUT_MS)
+            }.onFailure { e ->
+                Log.w(TAG, "fetchMp4Metadata: lần gọi embed retry ném exception: ${e.message}", e)
             }.getOrNull()
+            Log.d(TAG, "fetchMp4Metadata: lần 2 -> code=${response?.code} successful=${response?.isSuccessful}")
         }
 
         // Fail sớm và rõ ràng nếu Abyss trả lỗi HTTP (404/5xx/rate-limit...) hoặc lỗi
         // mạng cả 2 lần thử, thay vì để regex bên dưới âm thầm không tìm thấy "datas"
         // và trả null mập mờ — phân biệt được "trang embed lỗi" với "trang hợp lệ
         // nhưng đổi cấu trúc HTML".
-        if (response == null || !response.isSuccessful) return null
+        if (response == null || !response.isSuccessful) {
+            Log.e(TAG, "fetchMp4Metadata: THẤT BẠI - không lấy được trang embed sau 2 lần thử (videoId=$videoId, code=${response?.code})")
+            return null
+        }
         val html = response.text
+        Log.d(TAG, "fetchMp4Metadata: HTML embed dài ${html.length} ký tự")
 
         // HIỆU NĂNG: trước đây dùng Jsoup.parse() để dựng toàn bộ cây DOM của trang embed
         // rồi select("script") chỉ để tìm 1 dòng "const datas = ...". Parse DOM cho toàn
@@ -205,7 +229,12 @@ object HydraxExtractor {
         // HTML thô cho kết quả giống hệt (không phụ thuộc cấu trúc DOM) nhưng rẻ hơn
         // nhiều lần, và bỏ được toàn bộ chi phí dựng DOM cho mỗi lần lấy link HY.
         val encodedDatas = datasRegex.find(html)
-            ?.groupValues?.get(1) ?: return null
+            ?.groupValues?.get(1)
+        if (encodedDatas == null) {
+            Log.e(TAG, "fetchMp4Metadata: THẤT BẠI - không tìm thấy 'const datas = ...' trong HTML (trang embed có thể đã đổi cấu trúc, hoặc bị chặn Cloudflare/redirect). Xem 300 ký tự đầu HTML: ${html.take(300)}")
+            return null
+        }
+        Log.d(TAG, "fetchMp4Metadata: tìm thấy 'datas' (base64, dài ${encodedDatas.length} ký tự)")
 
         // SỬA LỖI (ổn định): decode/giải mã/parse JSON có thể ném exception nếu trang
         // embed đổi cấu trúc payload (base64 hỏng, AES key sai do thiếu field, JSON
@@ -215,14 +244,29 @@ object HydraxExtractor {
         // là "không lấy được metadata" (trả null) là hành vi rõ ràng và nhất quán hơn.
         return runCatching {
             val decodedJson = String(Base64.getDecoder().decode(encodedDatas), Charsets.ISO_8859_1)
+            Log.d(TAG, "fetchMp4Metadata: base64-decode datas OK, JSON dài ${decodedJson.length} ký tự")
             val datas = mapper.readValue(decodedJson, Datas::class.java)
-            val encryptedMedia = datas.media ?: return@runCatching null
+            Log.d(TAG, "fetchMp4Metadata: parse Datas OK -> md5_id=${datas.md5_id} slug=${datas.slug} user_id=${datas.user_id} media_len=${datas.media?.length}")
+            val encryptedMedia = datas.media
+            if (encryptedMedia == null) {
+                Log.e(TAG, "fetchMp4Metadata: THẤT BẠI - field 'media' rỗng/null trong datas đã parse")
+                return@runCatching null
+            }
 
             val mediaKey = keyForString("${datas.user_id}:${datas.slug}:${datas.md5_id}")
             val decryptedJson = aesCtrDecryptFromIso(encryptedMedia, mediaKey)
+            Log.d(TAG, "fetchMp4Metadata: giải mã AES-CTR OK, JSON video dài ${decryptedJson.length} ký tự")
             val video = mapper.readValue(decryptedJson, VideoData::class.java)
 
-            video.mp4?.copy(slug = datas.slug, md5_id = datas.md5_id)
+            val result = video.mp4?.copy(slug = datas.slug, md5_id = datas.md5_id)
+            if (result == null) {
+                Log.e(TAG, "fetchMp4Metadata: THẤT BẠI - field 'mp4' rỗng/null sau khi parse VideoData")
+            } else {
+                Log.d(TAG, "fetchMp4Metadata: THÀNH CÔNG -> domains=${result.domains} sources_count=${result.sources?.size} md5_id=${result.md5_id}")
+            }
+            result
+        }.onFailure { e ->
+            Log.e(TAG, "fetchMp4Metadata: EXCEPTION khi decode/giải mã/parse datas: ${e.message}", e)
         }.getOrNull()
     }
 
@@ -239,20 +283,52 @@ object HydraxExtractor {
         serverName: String?,
         referer: String
     ): List<ExtractorLink> {
-        val videoId = getVideoId(streamUrl) ?: return emptyList()
-        val mp4 = fetchMp4Metadata(videoId, referer) ?: return emptyList()
-        val md5Id = mp4.md5_id ?: return emptyList()
-        val domain = mp4.domains?.firstOrNull { !it.isNullOrBlank() } ?: return emptyList()
+        Log.d(TAG, "getLinks: BẮT ĐẦU streamUrl=$streamUrl providerName=$providerName serverName=$serverName referer=$referer")
+
+        val videoId = getVideoId(streamUrl)
+        if (videoId == null) {
+            Log.e(TAG, "getLinks: DỪNG - getVideoId trả về null cho streamUrl=$streamUrl")
+            return emptyList()
+        }
+
+        val mp4 = fetchMp4Metadata(videoId, referer)
+        if (mp4 == null) {
+            Log.e(TAG, "getLinks: DỪNG - fetchMp4Metadata trả về null cho videoId=$videoId (xem log fetchMp4Metadata phía trên để biết bước nào thất bại)")
+            return emptyList()
+        }
+
+        val md5Id = mp4.md5_id
+        if (md5Id == null) {
+            Log.e(TAG, "getLinks: DỪNG - mp4.md5_id null")
+            return emptyList()
+        }
+
+        val domain = mp4.domains?.firstOrNull { !it.isNullOrBlank() }
+        if (domain == null) {
+            Log.e(TAG, "getLinks: DỪNG - không có domain hợp lệ trong mp4.domains=${mp4.domains}")
+            return emptyList()
+        }
+
         val sources = mp4.sources?.filterNotNull().orEmpty()
+        Log.d(TAG, "getLinks: md5Id=$md5Id domain=$domain, tổng ${sources.size} sources thô")
+        if (sources.isEmpty()) {
+            Log.w(TAG, "getLinks: mp4.sources rỗng hoặc toàn null -> sẽ không có link nào được trả về")
+        }
+
         val displayBaseName = serverName?.takeIf { it.isNotBlank() } ?: "$providerName HY"
 
-        return sources.mapNotNull { source ->
-            val sub = source.sub ?: return@mapNotNull null
-            val size = source.size ?: return@mapNotNull null
-            val resId = source.res_id ?: return@mapNotNull null
+        val links = sources.mapIndexedNotNull { index, source ->
+            val sub = source.sub
+            val size = source.size
+            val resId = source.res_id
+            if (sub == null || size == null || resId == null) {
+                Log.w(TAG, "getLinks: bỏ qua source[$index] thiếu field bắt buộc -> sub=$sub size=$size resId=$resId label=${source.label}")
+                return@mapIndexedNotNull null
+            }
             val baseUrl = "https://$sub.${domain.substringAfter(".")}"
             val relayUrl = buildRelayUrl(baseUrl, md5Id, resId, size)
             val quality = source.label?.filter { it.isDigit() }?.toIntOrNull() ?: Qualities.Unknown.value
+            Log.d(TAG, "getLinks: source[$index] label=${source.label} quality=$quality baseUrl=$baseUrl relayUrl=$relayUrl size=$size")
 
             newExtractorLink(
                 providerName,
@@ -265,6 +341,9 @@ object HydraxExtractor {
                 this.headers = mapOf("Referer" to referer)
             }
         }
+
+        Log.d(TAG, "getLinks: KẾT THÚC - trả về ${links.size}/${sources.size} link hợp lệ cho videoId=$videoId")
+        return links
     }
 
     private fun buildRelayUrl(baseUrl: String, md5Id: Int, resId: Int, size: Long): String {
@@ -327,6 +406,8 @@ object HydraxInterceptor : Interceptor {
         Thread(runnable, "hydrax-prefetch").apply { isDaemon = true }
     }
 
+    private const val TAG = "HydraxInterceptor"
+
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         if (request.url.host != HydraxExtractor.RELAY_HOST) {
@@ -338,13 +419,17 @@ object HydraxInterceptor : Interceptor {
         val resId = request.url.queryParameter("res")?.toIntOrNull()
         val size = request.url.queryParameter("size")?.toLongOrNull()
 
+        Log.d(TAG, "intercept: relay request rangeHeader=${request.header("Range")} base=$baseUrl md5=$md5Id res=$resId size=$size")
+
         if (baseUrl == null || md5Id == null || resId == null || size == null) {
+            Log.e(TAG, "intercept: THẤT BẠI - thiếu tham số relay bắt buộc (base/md5/res/size), url=${request.url}")
             return errorResponse(request, 500, "Missing relay parameters")
         }
 
         val rangeHeader = request.header("Range")
         val (start, endInclusive) = parseRange(rangeHeader, size)
         if (start > endInclusive || start < 0) {
+            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
             return errorResponse(request, 416, "Invalid range")
         }
 
@@ -662,17 +747,21 @@ object HydraxInterceptor : Interceptor {
             return runCatching {
                 val resp = client.newCall(req).execute()
                 if (!resp.isSuccessful) {
+                    Log.w(TAG, "openSegmentStream: segIndex=$index -> HTTP ${resp.code} không thành công, url=$segUrl")
                     resp.close()
                     null
                 } else {
                     val source = resp.body?.source()
                     if (source == null) {
+                        Log.w(TAG, "openSegmentStream: segIndex=$index -> body rỗng dù code=${resp.code}")
                         resp.close()
                         null
                     } else {
                         resp to source
                     }
                 }
+            }.onFailure { e ->
+                Log.w(TAG, "openSegmentStream: segIndex=$index EXCEPTION khi mở kết nối segment: ${e.message}")
             }.getOrNull()
         }
 
