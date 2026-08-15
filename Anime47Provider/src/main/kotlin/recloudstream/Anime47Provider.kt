@@ -1012,6 +1012,35 @@ class Anime47Provider : MainAPI() {
             // khỏi khối xử lý "fix" bên dưới (vẫn chỉ chạy cho nonprofit.asia như cũ).
             Log.d(TAG, "getVideoInterceptor: request qua đây -> host=${request.url.host} path=${request.url.encodedPath} HTTP code=${response.code} Content-Type=${response.header("Content-Type")}")
 
+            // CHẨN ĐOÁN (nội dung thật của playlist): log ở trên chỉ cho biết HTTP code
+            // và Content-Type từ HEADER — không đảm bảo BODY thật sự là m3u8 hợp lệ. Log
+            // thực tế cho thấy ExoPlayer báo "ERROR_CODE_PARSING_CONTAINER_MALFORMED" +
+            // "Lỗi mã hóa" ngay sau khi tải xong 1 sub-playlist "/m3u8/<hash>/<token2>"
+            // (token khác với sub-playlist đầu tiên đã load OK trước đó — nhiều khả năng
+            // là bitrate/resolution thứ 2 trong danh sách adaptive), dù response header
+            // vẫn báo 200 + đúng Content-Type. Peek (đọc không tiêu thụ, không ảnh hưởng
+            // luồng dữ liệu ExoPlayer sẽ đọc sau) một đoạn ngắn ở đầu body để xem nội
+            // dung thật — phân biệt được các case: m3u8 hợp lệ thật (bắt đầu #EXTM3U),
+            // trang lỗi/HTML, JSON báo lỗi từ CDN, hoặc body rỗng/mã hoá lạ.
+            val contentType = response.header("Content-Type") ?: ""
+            if (contentType.contains("mpegurl", ignoreCase = true) || requestUrl.contains("/m3u8/")) {
+                val previewBody = response.body
+                if (previewBody != null) {
+                    try {
+                        val peekedSource = previewBody.source().peek()
+                        val previewBuffer = Buffer()
+                        peekedSource.read(previewBuffer, 300L)
+                        val previewText = runCatching { previewBuffer.readString(Charsets.UTF_8) }
+                            .getOrDefault("<không decode được UTF-8, có thể là binary>")
+                        Log.d(TAG, "getVideoInterceptor: url=$requestUrl NỘI DUNG playlist (300 ký tự đầu): $previewText")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "getVideoInterceptor: url=$requestUrl không peek được nội dung body: ${e.message}")
+                    }
+                } else {
+                    Log.w(TAG, "getVideoInterceptor: url=$requestUrl response.body() null, không có gì để peek")
+                }
+            }
+
             // SỬA LỖI (log nhiễu bởi ảnh poster): domain nonprofit.asia được CDN dùng
             // chung cho CẢ ảnh poster/thumbnail (path "/img/...") LẪN segment video thật.
             // Log thực tế cho thấy nhiều request "/img/..." bị match nhầm bởi cdnFixRegex
