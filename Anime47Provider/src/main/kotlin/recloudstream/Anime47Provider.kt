@@ -1041,16 +1041,23 @@ class Anime47Provider : MainAPI() {
                 }
             }
 
-            // SỬA LỖI (log nhiễu bởi ảnh poster): domain nonprofit.asia được CDN dùng
-            // chung cho CẢ ảnh poster/thumbnail (path "/img/...") LẪN segment video thật.
-            // Log thực tế cho thấy nhiều request "/img/..." bị match nhầm bởi cdnFixRegex
-            // (vì regex chỉ kiểm tra domain, không kiểm tra path), khiến code cố tìm byte
-            // đồng bộ MPEG-TS (0x47) trong 1 file PNG — luôn thất bại (offset=-1) một cách
-            // vô hại (ảnh vẫn hiển thị bình thường vì fallback trả nguyên response gốc),
-            // nhưng che khuất log thật của request segment video khi debug. Loại trừ path
-            // "/img/" khỏi phạm vi xử lý/log của interceptor này để log còn lại chỉ phản
-            // ánh đúng request video thật (m3u8 playlist, segment .ts, v.v.).
-            if (!cdnFixRegex.containsMatchIn(requestUrl) || requestUrl.contains("/img/")) {
+            // SỬA LỖI (ĐÃ THU HỒI loại trừ "/img/" — đây chính là nguyên nhân segment
+            // video không phát được): sub-playlist thật cho thấy segment video (#EXTINF)
+            // trỏ thẳng tới path "/img/..." trên domain nonprofit.asia, với header
+            // Content-Type: image/png — tức CDN NGỤY TRANG segment video (MPEG-TS) dưới
+            // vỏ bọc ảnh PNG để né hotlink-protection/anti-leech, dùng CHUNG path "/img/"
+            // với ảnh poster/thumbnail thật. Bản sửa trước loại trừ toàn bộ "/img/" ra
+            // khỏi xử lý tìm byte đồng bộ MPEG-TS (0x47) vì tưởng nhầm "/img/" luôn là
+            // ảnh thật — hệ quả: segment video thật bị bỏ qua hoàn toàn, ExoPlayer nhận
+            // nguyên response PNG giả và báo lỗi parse container (không tìm thấy sync
+            // byte hợp lệ). Cách phân biệt đúng KHÔNG phải qua path mà qua NỘI DUNG: ảnh
+            // PNG thật bắt đầu bằng magic bytes 89 50 4E 47, còn segment TS giả trang thì
+            // bắt đầu bằng chuỗi byte 0x47 lặp lại (MPEG-TS sync). Cho mọi request khớp
+            // domain nonprofit.asia (không phân biệt path) đi qua findMpegTsOffset(): với
+            // ảnh thật, hàm không tìm thấy offset hợp lệ -> giữ nguyên response (vô hại);
+            // với segment giả-PNG, hàm tìm được offset đúng -> cắt phần header PNG giả để
+            // lộ ra dữ liệu TS thật bên dưới.
+            if (!cdnFixRegex.containsMatchIn(requestUrl)) {
                 return@Interceptor response
             }
 
