@@ -441,6 +441,13 @@ object HydraxInterceptor : Interceptor {
         private val endByteInclusive: Long
     ) : Source {
 
+        companion object {
+            // DEBUG TẠM THỜI: chỉ quét N byte đầu mỗi segment thay vì toàn bộ 2MB,
+            // đủ để bắt các box/header MP4 điển hình (moov/mdat/stco/co64 thường nằm
+            // gần đầu segment liên quan) mà không tốn CPU quét hết mỗi fragment.
+            private const val DEBUG_SCAN_LIMIT = 65536 // 64 KB
+        }
+
         private var currentPos = startByte
         private val currentBuffer = Buffer()
 
@@ -504,10 +511,14 @@ object HydraxInterceptor : Interceptor {
             // Quét từng cửa sổ 4-byte (big-endian) tìm giá trị đáng ngờ:
             // - giá trị >= totalSize (không thể là 1 offset/size hợp lệ trong file)
             // - hoặc khớp/gần khớp con số lỗi đã thấy trong log thật (2222032263)
+            // GIỚI HẠN: chỉ quét tối đa DEBUG_SCAN_LIMIT byte đầu segment, không quét cả
+            // 2MB — quét toàn bộ mỗi segment sẽ tốn CPU đáng kể trên mỗi lần fetch và có
+            // thể làm trễ playback đủ để tự gây ra timeout/lỗi khác, làm nhiễu kết quả debug.
             val suspiciousTarget = 2222032263L
+            val scanLimit = minOf(bytes.size - 3, DEBUG_SCAN_LIMIT)
             var i = 0
             var hits = 0
-            while (i + 4 <= bytes.size && hits < 20) {
+            while (i < scanLimit && hits < 20) {
                 val v = ((bytes[i].toLong() and 0xFF) shl 24) or
                         ((bytes[i + 1].toLong() and 0xFF) shl 16) or
                         ((bytes[i + 2].toLong() and 0xFF) shl 8) or
@@ -525,7 +536,7 @@ object HydraxInterceptor : Interceptor {
                 i++
             }
             if (hits == 0) {
-                Log.d(TAG, "DEBUG segIndex=$index không tìm thấy giá trị 4-byte nào bất thường trong segment")
+                Log.d(TAG, "DEBUG segIndex=$index không tìm thấy giá trị 4-byte nào bất thường trong $scanLimit byte đầu segment")
             }
         }
 
