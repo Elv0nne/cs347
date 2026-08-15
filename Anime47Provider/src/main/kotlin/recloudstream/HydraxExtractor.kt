@@ -426,20 +426,29 @@ object HydraxInterceptor : Interceptor {
         private val currentBuffer = Buffer()
 
         override fun read(sink: Buffer, byteCount: Long): Long {
-            if (currentPos > endByteInclusive) return -1L
+            if (currentPos > endByteInclusive) {
+                Log.d(TAG, "SegmentSource.read: đã đọc hết range (currentPos=$currentPos > endByteInclusive=$endByteInclusive), kết thúc stream")
+                return -1L
+            }
 
             if (currentBuffer.exhausted()) {
                 val segIndex = (currentPos / FRAGMENT_SIZE).toInt()
                 val segStart = segIndex.toLong() * FRAGMENT_SIZE
                 val segmentBytes = fetchSegment(segIndex)
-                if (segmentBytes.isEmpty()) return -1L
+                if (segmentBytes.isEmpty()) {
+                    Log.e(TAG, "SegmentSource.read: THẤT BẠI - fetchSegment(segIndex=$segIndex) trả về rỗng tại currentPos=$currentPos md5Id=$md5Id resId=$resId baseUrl=$baseUrl, dừng stream")
+                    return -1L
+                }
                 val offsetInSeg = (currentPos - segStart).toInt().coerceIn(0, segmentBytes.size)
                 currentBuffer.write(segmentBytes, offsetInSeg, segmentBytes.size - offsetInSeg)
             }
 
             val remaining = endByteInclusive - currentPos + 1
             val toRead = minOf(byteCount, remaining, currentBuffer.size)
-            if (toRead <= 0) return -1L
+            if (toRead <= 0) {
+                Log.w(TAG, "SegmentSource.read: toRead<=0 (byteCount=$byteCount remaining=$remaining bufferSize=${currentBuffer.size}) tại currentPos=$currentPos, dừng stream")
+                return -1L
+            }
             val read = currentBuffer.read(sink, toRead)
             if (read > 0) currentPos += read
             return read
@@ -452,6 +461,7 @@ object HydraxInterceptor : Interceptor {
             val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
             val token = tokenFor(path)
             val segUrl = "$baseUrl/sora/$totalSize/$token"
+            Log.d(TAG, "fetchSegment: segIndex=$index md5Id=$md5Id resId=$resId totalSize=$totalSize url=$segUrl")
             val req = Request.Builder()
                 .url(segUrl)
                 .header("Referer", "https://abysscdn.com/")
@@ -462,11 +472,13 @@ object HydraxInterceptor : Interceptor {
                         Log.w(TAG, "fetchSegment: segIndex=$index -> HTTP ${resp.code} không thành công, url=$segUrl")
                         ByteArray(0)
                     } else {
-                        resp.body?.bytes() ?: ByteArray(0)
+                        val bytes = resp.body?.bytes() ?: ByteArray(0)
+                        Log.d(TAG, "fetchSegment: segIndex=$index THÀNH CÔNG, nhận ${bytes.size} byte")
+                        bytes
                     }
                 }
             }.onFailure { e ->
-                Log.w(TAG, "fetchSegment: segIndex=$index EXCEPTION khi tải segment: ${e.message}")
+                Log.w(TAG, "fetchSegment: segIndex=$index EXCEPTION khi tải segment (url=$segUrl): ${e.message}")
             }.getOrDefault(ByteArray(0))
         }
 
