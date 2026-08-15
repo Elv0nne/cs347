@@ -66,7 +66,7 @@ object HydraxExtractor {
     // Anime47Provider.cdnFixRegex / animeIdRegex và HydraxInterceptor.rangeHeaderRegex.
     private val datasRegex = Regex("""const\s+datas\s*=\s*"([^"]*)"""")
 
-    private val HY_HOSTS = listOf("abysscdn.com", "playhydrax.com", "zplayer.io", "short.ink")
+    private val HY_HOSTS = listOf("abysscdn.com", "playhydrax.com", "zplayer.io", "short.ink", "short.icu")
 
     // SỬA LỖI (timeout không khớp ngân sách thời gian): Anime47Provider.EPISODE_TIMEOUT_MS
     // (35s) được tính dựa trên giả định mỗi lần gọi embed Abyss ở đây tối đa 8s, nhưng
