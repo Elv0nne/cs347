@@ -906,6 +906,8 @@ class Anime47Provider : MainAPI() {
 
         // Chấp nhận mọi server có URL hợp lệ (FE, HY, hoặc bất kỳ server nào khác),
         // thay vì chỉ giới hạn ở "FE"/jwplayer.
+        Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận diện là FE/khác (không phải HY), xử lý như m3u8 trực tiếp")
+
         val headers = mutableMapOf(
             "Referer" to referer,
             "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
@@ -917,19 +919,36 @@ class Anime47Provider : MainAPI() {
         if (url.contains("vlogphim.net")) {
             headers["Origin"] = referer
             headers["authority"] = runCatching { URL(url).host }.getOrDefault("pl.vlogphim.net")
+            Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận diện url vlogphim.net, thêm header Origin/authority")
         }
 
-        val link = newExtractorLink(name, stream.server_name ?: name, url, ExtractorLinkType.M3U8) {
-            this.referer = referer
-            this.headers = headers
-            this.quality = Qualities.Unknown.value
-        }
+        Log.d(TAG, "loadSingleStream: server=${stream.server_name} headers cuối cùng: $headers")
 
-        Log.d(TAG, "loadSingleStream: server=${stream.server_name} link M3U8 trực tiếp, gửi callback")
-        callback(link)
-        loaded.set(true)
+        // SỬA LỖI (structured concurrency + thiếu log lỗi FE): trước đây đoạn này
+        // không có try/catch riêng, nên nếu newExtractorLink()/callback() ném lỗi, nó
+        // bay thẳng lên catchNonCancellation() ở loadEpisodeStreams() và bị gộp chung
+        // vào log "episodeId=... LỖI", không biết được cụ thể server FE nào là thủ
+        // phạm (đặc biệt hại khi 1 episode có nhiều server chạy song song). Bọc riêng
+        // bằng catchNonCancellation() giống nhánh HY để log rõ server + giữ nguyên tín
+        // hiệu hủy (timeout/sibling lỗi) thay vì nuốt mất.
+        val feLoaded = catchNonCancellation({
+            val link = newExtractorLink(name, stream.server_name ?: name, url, ExtractorLinkType.M3U8) {
+                this.referer = referer
+                this.headers = headers
+                this.quality = Qualities.Unknown.value
+            }
+
+            Log.d(TAG, "loadSingleStream: server=${stream.server_name} link M3U8 trực tiếp, gửi callback")
+            callback(link)
+            true
+        }, onError = { e ->
+            Log.e(TAG, "loadSingleStream: server=${stream.server_name} FE LỖI: ${e.message}", e)
+            false // bỏ qua lỗi riêng của server FE này, không chặn các server khác
+        })
+
+        if (feLoaded) loaded.set(true)
         forwardSubtitles()
-        return true
+        return feLoaded
     }
 
     /**
