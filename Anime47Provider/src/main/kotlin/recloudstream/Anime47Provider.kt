@@ -998,7 +998,32 @@ class Anime47Provider : MainAPI() {
         // được gọi (tức mỗi ExtractorLink của mỗi tập/mỗi server) — tránh chi phí compile
         // regex lặp lại không cần thiết.
         return Interceptor { chain ->
-            val request = chain.request()
+            var request = chain.request()
+
+            // SỬA LỖI (root cause thật sự của "Sorry, you have been blocked" trên CDN
+            // segment): loadSingleStream() gắn cứng header "authority" = host của
+            // pl.vlogphim.net (domain playlist gốc) + "Origin" = referer vào toàn bộ
+            // ExtractorLink. Cloudstream/OkHttp áp các header này cho MỌI request phái
+            // sinh từ cùng player session, kể cả các request tới segment nằm trên domain
+            // HOÀN TOÀN KHÁC (cdn4.nonprofit.asia, cdn6.nonprofit.asia...) được liệt kê
+            // bên trong sub-playlist m3u8. Hệ quả: request tới CDN segment mang header
+            // "authority: pl.vlogphim.net" không khớp Host thật (nonprofit.asia) — bị
+            // Cloudflare trên CDN đó coi là request giả mạo/bất thường và trả về trang
+            // chặn "Sorry, you have been blocked" (đã xác nhận qua ảnh chụp thực tế),
+            // với Content-Type bị đội lốt "image/png" khiến trước đây bị hiểu lầm là ảnh
+            // PNG thật. Sửa: nếu host thật của request KHÁC domain mà header
+            // "authority"/"Origin" đang trỏ tới, loại bỏ 2 header đó (để OkHttp tự set
+            // đúng theo Host thật) trước khi cho request đi tiếp.
+            val requestHost = request.url.host
+            val authorityHeader = request.header("authority")
+            if (authorityHeader != null && !authorityHeader.equals(requestHost, ignoreCase = true)) {
+                Log.d(TAG, "getVideoInterceptor: request tới host=$requestHost nhưng header 'authority' đang trỏ sai sang '$authorityHeader' -> loại bỏ header authority/Origin lệch domain")
+                request = request.newBuilder()
+                    .removeHeader("authority")
+                    .removeHeader("Origin")
+                    .build()
+            }
+
             val response = chain.proceed(request)
             val requestUrl = request.url.toString()
 
@@ -1041,23 +1066,19 @@ class Anime47Provider : MainAPI() {
                 }
             }
 
-            // SỬA LỖI (ĐÃ THU HỒI loại trừ "/img/" — đây chính là nguyên nhân segment
-            // video không phát được): sub-playlist thật cho thấy segment video (#EXTINF)
-            // trỏ thẳng tới path "/img/..." trên domain nonprofit.asia, với header
-            // Content-Type: image/png — tức CDN NGỤY TRANG segment video (MPEG-TS) dưới
-            // vỏ bọc ảnh PNG để né hotlink-protection/anti-leech, dùng CHUNG path "/img/"
-            // với ảnh poster/thumbnail thật. Bản sửa trước loại trừ toàn bộ "/img/" ra
-            // khỏi xử lý tìm byte đồng bộ MPEG-TS (0x47) vì tưởng nhầm "/img/" luôn là
-            // ảnh thật — hệ quả: segment video thật bị bỏ qua hoàn toàn, ExoPlayer nhận
-            // nguyên response PNG giả và báo lỗi parse container (không tìm thấy sync
-            // byte hợp lệ). Cách phân biệt đúng KHÔNG phải qua path mà qua NỘI DUNG: ảnh
-            // PNG thật bắt đầu bằng magic bytes 89 50 4E 47, còn segment TS giả trang thì
-            // bắt đầu bằng chuỗi byte 0x47 lặp lại (MPEG-TS sync). Cho mọi request khớp
-            // domain nonprofit.asia (không phân biệt path) đi qua findMpegTsOffset(): với
-            // ảnh thật, hàm không tìm thấy offset hợp lệ -> giữ nguyên response (vô hại);
-            // với segment giả-PNG, hàm tìm được offset đúng -> cắt phần header PNG giả để
-            // lộ ra dữ liệu TS thật bên dưới.
-            if (!cdnFixRegex.containsMatchIn(requestUrl)) {
+            // ĐÍNH CHÍNH (giả thuyết "/img/ giả trang TS" ở bản trước SAI): log thực tế
+            // xác nhận 16 byte đầu của response "/img/..." là 89 50 4E 47 0D 0A 1A 0A
+            // 00 00 00 0D 49 48 44 52 — ĐÚNG magic bytes chuẩn PNG (kèm cả chunk IHDR
+            // ngay sau), không phải MPEG-TS giả trang. Content-Length cũng lớn bất
+            // thường so với 1 segment TS 10s ở bitrate 375kbps (594KB–2.9MB so với ước
+            // tính ~470KB tối đa) — đây LÀ ảnh PNG thật. Việc tìm offset đồng bộ MPEG-TS
+            // trả về -1 là ĐÚNG (không có gì để sửa), không phải bug. Khôi phục lại loại
+            // trừ "/img/" khỏi cdnFixRegex-handling như bản gốc: vấn đề video không phát
+            // được KHÔNG nằm ở interceptor này, mà ở chỗ sub-playlist m3u8 từ
+            // pl.vlogphim.net TỰ LIỆT KÊ một URL ảnh PNG làm #EXTINF segment — tức lỗi
+            // nằm ở nội dung playlist trả về (server nguồn hoặc bước rewrite URL segment
+            // ở phía provider/interceptor khác), cần điều tra tại đó, không phải ở đây.
+            if (!cdnFixRegex.containsMatchIn(requestUrl) || requestUrl.contains("/img/")) {
                 return@Interceptor response
             }
 
