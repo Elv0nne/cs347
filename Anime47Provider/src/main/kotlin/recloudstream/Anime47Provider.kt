@@ -263,42 +263,90 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         // hủy lan truyền đúng thay vì bị nuốt bởi catch(e: Exception) thông thường.
         catchNonCancellation({
             watchProgressMutex.withLock {
-                val headers = getAuthHeaders()
-                if (!headers.containsKey("Authorization")) return@withLock // chưa đăng nhập
-
-                val body = toJson(
-                    mapOf(
-                        "episode_id" to episodeId,
-                        "progress_seconds" to progressSeconds,
-                        // Mirror hành vi heartbeat ~30s của web thật (xem ghi chú tại
-                        // dailyCheckinDone) — giá trị cố định 30 khớp với những gì
-                        // DevTools quan sát được từ web, độc lập với chu kỳ ticker thực
-                        // tế phía app (15s) vì server chỉ quan tâm progress_seconds tích
-                        // luỹ, không quan tâm khoảng cách thời gian thật giữa 2 lần gọi.
-                        "seconds_watched" to 30
-                    )
-                ).toRequestBody("application/json".toMediaTypeOrNull())
-
-                app.post(
-                    "$apiBaseUrl/dcc/watch-progress",
-                    headers = headers + mapOf(
-                        "origin" to mainUrl,
-                        "referer" to "$mainUrl/"
-                    ),
-                    requestBody = body,
-                    interceptor = interceptor,
-                    timeout = 10000
-                )
-                Log.d(
-                    TAG,
-                    "onWatchProgress: đã báo episodeId=$episodeId progress_seconds=$progressSeconds " +
-                        "(pos=${positionMs / 1000}s/dur=${durationMs / 1000}s)"
-                )
+                postWatchProgress(episodeId, progressSeconds, forceRefresh = false)
             }
         }, onError = { e ->
             // Best effort: lỗi mạng/token không được làm gián đoạn playback.
             Log.w(TAG, "onWatchProgress: LỖI episodeId=$episodeId: ${e.message}")
         })
+    }
+
+    // SỬA LỖI (token hết hạn giữa lúc xem phim dài -> watch-progress âm thầm thất bại
+    // không cộng điểm): onWatchProgress() trước đây chỉ gọi getAuthHeaders() (không
+    // forceRefresh) rồi app.post() thẳng, khác với fetchApi() (dùng cho toàn bộ luồng
+    // chính getMainPage/search/load/loadLinks) vốn tự phát hiện response
+    // 401/PRIVATE_MODE/TOKEN_EXPIRED và đăng nhập lại 1 lần trước khi coi là lỗi thật.
+    // Vì phiên xem 1 tập có thể kéo dài hàng chục phút (nhiều lần gọi onWatchProgress
+    // mỗi ~15s), token hoàn toàn có thể hết hạn giữa chừng — không có logic refresh ở
+    // đây thì mọi lần báo tiến độ SAU thời điểm đó sẽ lặng lẽ thất bại (bị nuốt bởi
+    // catchNonCancellation ở trên, đúng ý "best effort" nhưng không có cơ hội tự phục
+    // hồi), khiến progress_seconds server nhận được dừng lại giữa chừng dù user vẫn
+    // đang xem tiếp bình thường -> không đạt ngưỡng ~80% để cộng điểm.
+    //
+    // Áp dụng lại đúng pattern retry-1-lần đã có ở fetchApi(): thử với token hiện tại
+    // trước, nếu response cho thấy token hỏng (401 hoặc body chứa các dấu hiệu ở
+    // looksExpiredOrUnauthorized) thì ép đăng nhập lại (forceRefresh=true, kèm
+    // staleToken để ensureToken() biết token nào cần thay dưới lock) rồi gọi lại đúng
+    // 1 lần. Không retry vô hạn để tránh loop nếu tài khoản thực sự đã mất hiệu lực
+    // (mật khẩu đổi, bị khoá, ...).
+    private suspend fun postWatchProgress(
+        episodeId: Int,
+        progressSeconds: Int,
+        forceRefresh: Boolean,
+        staleToken: String? = null
+    ) {
+        val headers = getAuthHeaders(forceRefresh = forceRefresh, staleToken = staleToken)
+        val currentToken = headers["Authorization"]?.removePrefix("Bearer ")
+        if (currentToken == null) {
+            Log.d(TAG, "postWatchProgress: SKIPPED (chưa đăng nhập / không lấy được token) episodeId=$episodeId")
+            return
+        }
+
+        val body = toJson(
+            mapOf(
+                "episode_id" to episodeId,
+                "progress_seconds" to progressSeconds,
+                // Mirror hành vi heartbeat ~30s của web thật (xem ghi chú tại
+                // dailyCheckinDone) — giá trị cố định 30 khớp với những gì
+                // DevTools quan sát được từ web, độc lập với chu kỳ ticker thực
+                // tế phía app (15s) vì server chỉ quan tâm progress_seconds tích
+                // luỹ, không quan tâm khoảng cách thời gian thật giữa 2 lần gọi.
+                "seconds_watched" to 30
+            )
+        ).toRequestBody("application/json".toMediaTypeOrNull())
+
+        val response = app.post(
+            "$apiBaseUrl/dcc/watch-progress",
+            headers = headers + mapOf(
+                "origin" to mainUrl,
+                "referer" to "$mainUrl/"
+            ),
+            requestBody = body,
+            interceptor = interceptor,
+            timeout = 10000
+        )
+
+        // SỬA LỖI (staleToken thiếu -> retry không thực sự login lại): truyền
+        // currentToken (token VỪA DÙNG cho request vừa thất bại) làm staleToken khi
+        // retry. ensureToken(forceRefresh=true, staleToken=...) chỉ bỏ qua việc login
+        // lại nếu cachedToken hiện tại KHÁC staleToken (tức đã có coroutine khác login
+        // lại thành công). Nếu gọi forceRefresh=true mà không truyền staleToken (=null),
+        // và cachedToken vẫn đang là chính token hỏng vừa dùng (trường hợp phổ biến
+        // nhất — không có ai khác đua login), điều kiện "existing != staleToken" so
+        // token-hỏng với null sẽ luôn đúng -> ensureToken trả về NGUYÊN token hỏng đó
+        // mà không hề gọi lại /auth/login, khiến retry lặp lại y hệt lỗi 401 ban đầu.
+        val looksStale = !forceRefresh &&
+            (response.code == 401 || looksExpiredOrUnauthorized(response.text))
+        if (looksStale) {
+            Log.w(TAG, "postWatchProgress: episodeId=$episodeId token hết hạn (code=${response.code}), thử đăng nhập lại rồi retry 1 lần")
+            postWatchProgress(episodeId, progressSeconds, forceRefresh = true, staleToken = currentToken)
+            return
+        }
+
+        Log.d(
+            TAG,
+            "postWatchProgress: đã báo episodeId=$episodeId progress_seconds=$progressSeconds code=${response.code}"
+        )
     }
 
     // GHI CHÚ BẢO MẬT (không sửa trong bản này để tránh phá vỡ UI cài đặt đang hoạt
@@ -1770,5 +1818,4 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         val results: List<SearchItem>?,
         val has_more: Boolean?
     )
-}
- 
+} 
