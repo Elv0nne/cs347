@@ -49,6 +49,7 @@ import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 import java.io.IOException
 import java.net.URL
@@ -1067,7 +1068,31 @@ class Anime47Provider : MainAPI() {
                     .build()
             }
 
-            val response = chain.proceed(request)
+            // SỬA LỖI (root cause thật sự: TLS/HTTP fingerprinting, không phải thiếu
+            // header): đã xác nhận qua so sánh request headers thực tế — request app gửi
+            // tới nonprofit.asia đã KHỚP HOÀN TOÀN với request trình duyệt thật (kể cả
+            // Sec-Fetch-*, Referer, Range, User-Agent), nhưng vẫn nhận về ảnh PNG "mồi
+            // nhử" cho MỘT SỐ video cụ thể (đã xác nhận: cùng URL segment, web phát được
+            // bình thường, app vẫn lỗi). Vì mọi header HTTP đã khớp mà kết quả vẫn khác
+            // nhau, khác biệt còn lại nằm ở tầng THẤP HƠN header — nhiều khả năng là
+            // TLS/JA3 hoặc HTTP/2 fingerprint: OkHttp (client HTTP thuần app đang dùng)
+            // có "chữ ký" bắt tay TLS khác hẳn trình duyệt thật dù header giống hệt, và
+            // CDN chống hotlink hiện đại có thể soi đúng điểm này để quyết định trả nội
+            // dung thật hay ảnh giả.
+            //
+            // LƯU Ý KỸ THUẬT: CloudflareKiller.intercept(chain) đọc request từ CHÍNH
+            // chain được truyền vào, không biết tới biến "request" cục bộ đã được dọn
+            // header authority/Origin ở trên — vì OkHttp Interceptor.Chain không cho
+            // "thay" request đang giữ trừ khi gọi chain.proceed(request) trực tiếp. Do
+            // đó KHÔNG gọi interceptor.intercept(chain) ngay từ đầu (sẽ mất phần dọn
+            // header đã làm). Thay vào đó: luôn proceed bằng request đã dọn header như
+            // cũ trước; chỉ khi response cho nonprofit.asia trông giống "ảnh giả" (PNG
+            // hợp lệ nhưng không phải segment thật — xem đoạn phát hiện bên dưới) mới
+            // fallback sang app.get(..., interceptor = interceptor) qua CloudflareKiller
+            // (WebView thật, mang đúng TLS/HTTP fingerprint trình duyệt) để thử lấy lại
+            // đúng nội dung, giữ request gốc + response gốc làm phương án cuối nếu
+            // fallback cũng thất bại.
+            var response = chain.proceed(request)
             val requestUrl = request.url.toString()
 
             // CHẨN ĐOÁN (log tổng quát): trước đây interceptor chỉ log khi request khớp
@@ -1195,7 +1220,42 @@ class Anime47Provider : MainAPI() {
                     if (looksLikeCloudflareBlock) {
                         Log.e(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl NGHI VẤN đây là TRANG CHẶN CLOUDFLARE giả dạng Content-Type image/png (tìm thấy chuỗi 'cloudflare'/'blocked'/'<html' trong $peekedBytes byte đầu) -> KHÔNG PHẢI segment video thật, cần xử lý challenge Cloudflare thay vì tìm sync-byte")
                     } else {
-                        Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl KHÔNG tìm thấy byte đồng bộ MPEG-TS (0x47) trong $peekedBytes byte đầu, cũng KHÔNG có dấu hiệu trang chặn Cloudflare -> có thể là ảnh/segment không xác định, giữ nguyên response")
+                        Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl KHÔNG tìm thấy byte đồng bộ MPEG-TS (0x47) trong $peekedBytes byte đầu, cũng KHÔNG có dấu hiệu trang chặn Cloudflare -> thử fallback qua CloudflareKiller (WebView, fingerprint giống trình duyệt thật) để loại trừ khả năng TLS/HTTP fingerprinting")
+                    }
+
+                    // SỬA LỖI (fallback fingerprinting): đã xác nhận qua thực nghiệm rằng
+                    // với các segment "ảnh giả" này, header HTTP đã khớp hoàn toàn với
+                    // trình duyệt thật mà vẫn nhận sai nội dung -> nghi vấn CDN phân biệt
+                    // ở tầng TLS/HTTP2 fingerprint (điều header thường không giả mạo
+                    // được). Thử lại CHÍNH request này qua CloudflareKiller (interceptor
+                    // đã có sẵn trong class, chạy qua WebView thật -> mang đúng fingerprint
+                    // trình duyệt) — chỉ khi fallback này cũng không tìm được sync-byte
+                    // mới thực sự bó tay và giữ nguyên response gốc như trước.
+                    if (!looksLikeCloudflareBlock) {
+                        val fallbackResult = runCatching {
+                            app.get(requestUrl, headers = mapOf(
+                                "Referer" to (request.header("Referer") ?: ""),
+                                "Sec-Fetch-Dest" to "video",
+                                "Sec-Fetch-Mode" to "no-cors",
+                                "Sec-Fetch-Site" to "cross-site"
+                            ), interceptor = interceptor, timeout = 15000)
+                        }
+                        val fallbackBytes = fallbackResult.getOrNull()?.body?.bytes()
+                        if (fallbackBytes != null && fallbackBytes.isNotEmpty()) {
+                            val fallbackOffset = findMpegTsOffset(fallbackBytes)
+                            val fallbackHex = (0 until minOf(16, fallbackBytes.size)).joinToString(" ") { "%02x".format(fallbackBytes[it]) }
+                            Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CloudflareKiller trả về ${fallbackBytes.size} byte, 16 byte hex đầu=[$fallbackHex], offset=$fallbackOffset")
+                            if (fallbackOffset > 0) {
+                                Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback THÀNH CÔNG, tìm thấy segment TS thật qua CloudflareKiller -> dùng nội dung fallback thay response gốc")
+                                val trimmed = fallbackBytes.copyOfRange(fallbackOffset, fallbackBytes.size)
+                                val fallbackBody = trimmed.toResponseBody(body.contentType())
+                                return@Interceptor response.newBuilder().body(fallbackBody).build()
+                            } else {
+                                Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CloudflareKiller CŨNG không tìm được sync-byte -> đây thực sự là nội dung server trả về (không phải do fingerprinting), giữ nguyên response gốc")
+                            }
+                        } else {
+                            Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CloudflareKiller thất bại hoặc rỗng (${fallbackResult.exceptionOrNull()?.message}), giữ nguyên response gốc")
+                        }
                     }
                 } else {
                     source.skip(offset.toLong())
