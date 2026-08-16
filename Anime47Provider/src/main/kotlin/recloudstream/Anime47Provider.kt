@@ -242,7 +242,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
     override suspend fun onWatchProgress(data: String, positionMs: Long, durationMs: Long) {
         if (durationMs <= 0L) return // tránh chia cho 0 / dữ liệu duration chưa sẵn sàng
 
-        val episodeId: Int? = try {
+        val resolvedEpisodeId: Int = try {
             if (data.startsWith("[")) {
                 mapper.readValue(data, object : TypeReference<List<Int>>() {}).firstOrNull()
             } else {
@@ -252,7 +252,6 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             Log.w(TAG, "onWatchProgress: không parse được data='$data' thành episodeId: ${e.message}")
             null
         } ?: return
-        val resolvedEpisodeId: Int = episodeId
 
         val progressSeconds = (positionMs / 1000L).toInt()
         if (progressSeconds <= 0) return // chưa xem gì đáng kể, không cần báo
