@@ -5,36 +5,36 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import java.net.URI
 import java.net.HttpURLConnection
 
-// TỰ ĐỘNG LẤY COMMIT HASH CỦA TAG "pre-release" (thay vì hardcode tay như trước).
+// TỰ ĐỘNG LẤY COMMIT HASH CỦA TAG "manual-1" (bản release chính thức đã publish
+// trên repo Elv0nne/cloudstream, thay vì "pre-release" như trước).
 // Lý do: overrideUrlPrefix() bên dưới tải classes.jar (dùng lúc RUNTIME) theo TAG
-// "pre-release", và tag này bị move tới commit mới nhất trên master mỗi lần push
-// (xem prerelease.yml). Nếu coordinate JitPack (dùng để compile stub) bị hardcode
-// một hash cũ, plugin sẽ build lệch khỏi app thật đang chạy -> lỗi hàng loạt.
+// "manual-1". Nếu coordinate JitPack (dùng để compile stub) bị hardcode một hash cũ
+// hoặc lệch tag, plugin sẽ build lệch khỏi app thật đang chạy -> lỗi hàng loạt.
 // Gọi GitHub API ngay tại thời điểm build để lấy ĐÚNG commit mà tag đang trỏ tới,
 // đảm bảo compile-time stub và runtime classes.jar luôn khớp nhau tự động.
-fun resolvePreReleaseCommitHash(): String {
-    val fallback = "d4b0843" // dùng nếu API lỗi/rate-limit, tránh build fail hoàn toàn
+fun resolveReleaseCommitHash(): String {
+    val fallback = "38c51e8" // dùng nếu API lỗi/rate-limit, tránh build fail hoàn toàn
     return try {
-        val url = URI("https://api.github.com/repos/Elv0nne/cloudstream/git/ref/tags/pre-release").toURL()
+        val url = URI("https://api.github.com/repos/Elv0nne/cloudstream/git/ref/tags/manual-1").toURL()
         val conn = url.openConnection() as HttpURLConnection
         conn.setRequestProperty("Accept", "application/vnd.github+json")
         conn.connectTimeout = 10_000
         conn.readTimeout = 10_000
         val text = conn.inputStream.bufferedReader().readText()
-        // Tag "pre-release" là lightweight tag -> object.sha ở ref API CHÍNH LÀ commit
+        // Tag "manual-1" là lightweight tag -> object.sha ở ref API CHÍNH LÀ commit
         // hash luôn (không phải annotated tag object cần thêm 1 lượt gọi resolve nữa).
         val sha = Regex("\"sha\"\\s*:\\s*\"([0-9a-f]{7,40})\"").find(text)?.groupValues?.get(1)
         (sha?.take(7) ?: fallback).also {
-            logger.lifecycle("[Anime47Provider] resolved pre-release commit = $it")
+            logger.lifecycle("[Anime47Provider] resolved manual-1 commit = $it")
         }
     } catch (e: Exception) {
-        logger.warn("[Anime47Provider] Không lấy được commit hash pre-release qua API (${e.message}), dùng fallback=$fallback. " +
+        logger.warn("[Anime47Provider] Không lấy được commit hash manual-1 qua API (${e.message}), dùng fallback=$fallback. " +
             "Nếu app trên máy KHÔNG phải build từ commit $fallback, hãy build lại khi có mạng để tự động khớp đúng bản.")
         fallback
     }
 }
 
-val preReleaseCommitHash = resolvePreReleaseCommitHash()
+val releaseCommitHash = resolveReleaseCommitHash()
 
 buildscript {
     repositories {
@@ -73,34 +73,19 @@ subprojects {
         // when running through github workflow, GITHUB_REPOSITORY should contain current repository name
         setRepo(System.getenv("GITHUB_REPOSITORY") ?: "Elv0nne/uhnimefourseven")
 
-        // QUAN TRỌNG: cloudstream Gradle plugin (com.github.recloudstream:gradle) tự
-        // tải "cloudstream.jar" (dùng làm compileOnly stub, KHÁC với dependency
-        // "cloudstream(...)" khai báo bên dưới trong khối dependencies{}, cái đó chỉ
-        // ảnh hưởng tới coordinate JitPack cho phần khác) từ URL HARDCODE trong chính
-        // source của plugin:
-        //   ApkInfo.urlPrefix mặc định = "https://github.com/recloudstream/cloudstream/releases/download/${version}"
-        // (xem CloudstreamExtension.kt + CloudstreamConfigurationProvider.kt trong
-        // repo recloudstream/gradle). URL này LUÔN trỏ về repo GỐC
-        // recloudstream/cloudstream, bất kể coordinate JitPack mình khai báo là gì —
-        // đây là lý do bản build trước lỗi 404 vào
-        // ".../recloudstream/cloudstream/releases/download/9b9ae65/classes.jar"
-        // (release "9b9ae65" không tồn tại ở repo GỐC, vì đó là commit hash bên FORK
-        // của mình).
+        // overrideUrlPrefix() ghi đè urlPrefix mặc định (luôn trỏ về repo GỐC
+        // recloudstream/cloudstream), trỏ sang GitHub Release thật của fork
+        // Elv0nne/cloudstream — release này đã tồn tại với tag "manual-1" (commit
+        // 38c51e8, khác với tag di động "pre-release"). Kết quả: plugin sẽ tải
+        // "https://github.com/Elv0nne/cloudstream/releases/download/manual-1/classes.jar"
+        // — ĐÚNG bản release ổn định đã patch WatchProgressListener.
         //
-        // overrideUrlPrefix() ghi đè urlPrefix đó, trỏ sang GitHub Release thật của
-        // fork Elv0nne/cloudstream — release này đã tồn tại (workflow "Pre-release"
-        // trong fork tự tạo/update GitHub Release tag "pre-release" mỗi lần push lên
-        // master, đính kèm đúng file "classes.jar" cần thiết, xem
-        // .github/workflows/prerelease.yml). Kết quả: plugin sẽ tải
-        // "https://github.com/Elv0nne/cloudstream/releases/download/pre-release/classes.jar"
-        // — ĐÚNG bản đã patch WatchProgressListener.
-        //
-        // LƯU Ý: dùng tag "pre-release" ở đây (khác với commit hash "9b9ae65" dùng
-        // cho coordinate JitPack bên dưới) vì GitHub Release attach file theo TAG,
-        // không theo commit hash — và workflow luôn move tag "pre-release" tới commit
-        // mới nhất trên master mỗi lần push, nên nó tự động theo kịp các patch sau
-        // này miễn là bạn đã push code mới lên fork trước khi build plugin.
-        overrideUrlPrefix("https://github.com/Elv0nne/cloudstream/releases/download/pre-release")
+        // LƯU Ý: nếu sau này bạn tạo release mới thay thế "manual-1" (ví dụ
+        // "manual-2"), nhớ cập nhật cả 3 chỗ dùng tag này trong file (endpoint GitHub
+        // API resolveReleaseCommitHash(), overrideUrlPrefix() ở đây, và coordinate
+        // JitPack bên dưới) để tránh lệch giữa compile-time stub và runtime
+        // classes.jar.
+        overrideUrlPrefix("https://github.com/Elv0nne/cloudstream/releases/download/manual-1")
     }
 
     android {
@@ -134,37 +119,20 @@ subprojects {
         val implementation by configurations
 
         // Stubs for all cloudstream classes.
-        //
-        // ĐÃ SỬA: trỏ sang bản fork đã patch (thêm WatchProgressListener vào
-        // MainAPI.kt + forward vị trí phát thật trong GeneratorPlayer.kt) thay vì
-        // "com.lagradost:cloudstream3:pre-release" chính thức — bản chính thức
+        // Dùng bản fork đã patch (thêm WatchProgressListener vào MainAPI.kt +
+        // forward vị trí phát thật trong GeneratorPlayer.kt) vì bản chính thức
         // KHÔNG có interface WatchProgressListener nên biên dịch sẽ lỗi
         // "Unresolved reference 'WatchProgressListener'".
         //
-        // XÁC NHẬN THẬT qua JitPack build log (2026-08-14): coordinate
-        // "com.github.Elv0nne.cloudstream:library:9b9ae65" build SUCCESSFUL, publish
-        // đúng 3 artifact (library, library-jvm, library-android) — dùng thẳng
-        // "library" để Gradle/cloudstream plugin tự chọn đúng variant (android/jvm)
-        // theo target đang build, không cần chỉ định hậu tố thủ công.
+        // TỰ ĐỘNG: dùng đúng commit mà tag "manual-1" đang trỏ tới NGAY LÚC build này
+        // chạy (xem resolveReleaseCommitHash() ở đầu file) — không hardcode tay, nên
+        // compile-time stub và runtime classes.jar (tải qua overrideUrlPrefix ở trên,
+        // cũng theo tag "manual-1") luôn tự khớp nhau.
         //
-        // Dùng version cố định là commit hash "9b9ae65" (không dùng tag "pre-release"
-        // vì tag đó bị MOVE lại mỗi lần push mới lên Elv0nne/cloudstream, không đảm
-        // bảo luôn trỏ đúng bản đã build-verify này). Nếu sau này patch thêm code
-        // trên fork, thay "9b9ae65" bằng commit hash mới, rồi tự verify lại qua
-        // https://jitpack.io/#Elv0nne/cloudstream/<commit-hash> (bấm "Get it", đợi
-        // "BUILD SUCCESSFUL") trước khi build plugin, để tránh build lỗi hoặc dùng
-        // nhầm bản jitpack cache cũ.
-        // TỰ ĐỘNG: dùng đúng commit mà tag "pre-release" đang trỏ tới NGAY LÚC build
-        // này chạy (xem resolvePreReleaseCommitHash() ở đầu file) — không còn hardcode
-        // tay, nên compile-time stub và runtime classes.jar (tải qua overrideUrlPrefix
-        // ở trên, cũng theo tag "pre-release") luôn tự khớp nhau.
-        //
-        // LƯU Ý QUAN TRỌNG: cách này chỉ đúng nếu bạn build LẠI PLUGIN mỗi khi build
-        // lại APP (APK mới = tag pre-release đã move sang commit mới). Nếu bạn build
-        // app xong, ĐỢI một lúc rồi mới build plugin, và trong lúc đó push thêm commit
-        // khác lên fork, tag sẽ move tiếp -> vẫn có thể lệch. An toàn nhất: build app
-        // và build plugin ngay sát nhau, không push gì ở giữa.
-        cloudstream("com.github.Elv0nne.cloudstream:library:$preReleaseCommitHash")
+        // Đã xác nhận qua JitPack build log
+        // (https://jitpack.io/com/github/Elv0nne/cloudstream/manual-1/build.log):
+        // coordinate build cho tag "manual-1" tồn tại trên JitPack.
+        cloudstream("com.github.Elv0nne.cloudstream:library:$releaseCommitHash")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
@@ -180,4 +148,4 @@ subprojects {
 
 task<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
-}  
+} 
