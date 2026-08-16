@@ -362,18 +362,30 @@ object HydraxInterceptor : Interceptor {
         }
 
         val rangeHeader = request.header("Range")
-        val (start, endInclusive) = parseRange(rangeHeader, size)
-        if (start > endInclusive || start < 0) {
-            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
-            // SỬA LỖI (xác nhận qua log thực tế: Kanefusa | HY 720p — player gửi Range
-            // start=2222032263, vượt xa size=206394889 thật của file, rơi vào nhánh
-            // này). Response 416 cũ trả về KHÔNG có header "Content-Range", vi phạm RFC
-            // 7233 §4.4 (416 PHẢI có "Content-Range: bytes */<độ_dài_thật>" để client
-            // biết độ dài thật của resource mà tự điều chỉnh lại vị trí seek). Thiếu
-            // header này khiến OkHttp/ExoPlayer không có cách nào phục hồi sau 1 lần
-            // seek quá đà — coi đây là lỗi chí mạng và dừng hẳn stream thay vì chỉ lùi
-            // lại vị trí seek hợp lệ gần nhất rồi phát tiếp bình thường.
+        var (start, endInclusive) = parseRange(rangeHeader, size)
+
+        // SỬA LỖI (xác nhận qua log thực tế: Kanefusa | HY 720p — player gửi Range
+        // start=2222032263, vượt xa size=206394889 thật của file). Trả 416 (kể cả có
+        // Content-Range đúng chuẩn RFC 7233) vẫn KHÔNG đủ: nhiều bản ExoPlayer coi bất
+        // kỳ response non-2xx nào từ nguồn dữ liệu là lỗi chí mạng và dừng hẳn, không
+        // tự động lùi seek lại rồi thử lại. Vì vậy khi start nằm ngoài file, thay vì
+        // báo lỗi, ta CLAMP start về byte hợp lệ cuối cùng (size-1) và vẫn trả 206 với
+        // Content-Range đúng vị trí thật — player nhận được dữ liệu (dù không đúng vị
+        // trí nó yêu cầu), thấy Content-Range thực tế trong response, và tự điều chỉnh
+        // nội bộ thay vì crash stream. Chỉ start<0 mới thực sự không hợp lệ (không thể
+        // clamp một cách có ý nghĩa) nên vẫn trả 416 cho trường hợp đó.
+        if (start < 0) {
+            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ (start<0) start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
             return errorResponse(request, 416, "Range Not Satisfiable", extraHeaders = mapOf("Content-Range" to "bytes */$size"))
+        }
+        if (start >= size) {
+            val clampedStart = size - 1
+            Log.w(TAG, "intercept: CLAMP - start=$start vượt quá size=$size (player seek quá đà), lùi về clampedStart=$clampedStart rangeHeader=$rangeHeader")
+            start = clampedStart
+            endInclusive = size - 1
+        } else if (start > endInclusive) {
+            Log.w(TAG, "intercept: CLAMP - endInclusive=$endInclusive < start=$start, đặt lại endInclusive=size-1 size=$size rangeHeader=$rangeHeader")
+            endInclusive = size - 1
         }
 
         val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, size, start, endInclusive)
