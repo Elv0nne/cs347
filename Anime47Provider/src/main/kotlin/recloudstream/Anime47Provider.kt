@@ -47,6 +47,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -1231,30 +1233,46 @@ class Anime47Provider : MainAPI() {
                     // đã có sẵn trong class, chạy qua WebView thật -> mang đúng fingerprint
                     // trình duyệt) — chỉ khi fallback này cũng không tìm được sync-byte
                     // mới thực sự bó tay và giữ nguyên response gốc như trước.
+                    //
+                    // SỬA LỖI (build fail: "suspend fun get(...) can only be called from a
+                    // coroutine"): getVideoInterceptor() trả về okhttp3.Interceptor chuẩn,
+                    // intercept() chạy trên thread pool của OkHttp — KHÔNG có coroutine
+                    // scope nên không thể gọi trực tiếp app.get() (suspend). Bọc bằng
+                    // runBlocking{} có thể compile được nhưng RỦI RO CAO trong Android:
+                    // block chính thread OkHttp đang xử lý response cho ExoPlayer, có thể
+                    // gây deadlock/treo app khi nhiều request chạy đồng thời. Sửa đúng
+                    // cách: dùng OkHttpClient thuần (execute() blocking tự nhiên, không
+                    // cần coroutine) — giống chính xác cách HydraxInterceptor.intercept()
+                    // ở trên đã làm cho segment Hydrax, thay vì gọi qua app.get().
                     if (!looksLikeCloudflareBlock) {
                         val fallbackResult = runCatching {
-                            app.get(requestUrl, headers = mapOf(
-                                "Referer" to (request.header("Referer") ?: ""),
-                                "Sec-Fetch-Dest" to "video",
-                                "Sec-Fetch-Mode" to "no-cors",
-                                "Sec-Fetch-Site" to "cross-site"
-                            ), interceptor = interceptor, timeout = 15000)
+                            val fallbackClient = OkHttpClient()
+                            val fallbackReq = Request.Builder()
+                                .url(requestUrl)
+                                .header("Referer", request.header("Referer") ?: "")
+                                .header("Sec-Fetch-Dest", "video")
+                                .header("Sec-Fetch-Mode", "no-cors")
+                                .header("Sec-Fetch-Site", "cross-site")
+                                .build()
+                            fallbackClient.newCall(fallbackReq).execute().use { resp ->
+                                resp.body?.bytes()
+                            }
                         }
-                        val fallbackBytes = fallbackResult.getOrNull()?.body?.bytes()
+                        val fallbackBytes = fallbackResult.getOrNull()
                         if (fallbackBytes != null && fallbackBytes.isNotEmpty()) {
                             val fallbackOffset = findMpegTsOffset(fallbackBytes)
                             val fallbackHex = (0 until minOf(16, fallbackBytes.size)).joinToString(" ") { "%02x".format(fallbackBytes[it]) }
-                            Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CloudflareKiller trả về ${fallbackBytes.size} byte, 16 byte hex đầu=[$fallbackHex], offset=$fallbackOffset")
+                            Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback OkHttp thuần trả về ${fallbackBytes.size} byte, 16 byte hex đầu=[$fallbackHex], offset=$fallbackOffset")
                             if (fallbackOffset > 0) {
-                                Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback THÀNH CÔNG, tìm thấy segment TS thật qua CloudflareKiller -> dùng nội dung fallback thay response gốc")
+                                Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback THÀNH CÔNG, tìm thấy segment TS thật -> dùng nội dung fallback thay response gốc")
                                 val trimmed = fallbackBytes.copyOfRange(fallbackOffset, fallbackBytes.size)
                                 val fallbackBody = trimmed.toResponseBody(body.contentType())
                                 return@Interceptor response.newBuilder().body(fallbackBody).build()
                             } else {
-                                Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CloudflareKiller CŨNG không tìm được sync-byte -> đây thực sự là nội dung server trả về (không phải do fingerprinting), giữ nguyên response gốc")
+                                Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CŨNG không tìm được sync-byte -> đây thực sự là nội dung server trả về (không phải do fingerprinting), giữ nguyên response gốc")
                             }
                         } else {
-                            Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CloudflareKiller thất bại hoặc rỗng (${fallbackResult.exceptionOrNull()?.message}), giữ nguyên response gốc")
+                            Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback thất bại hoặc rỗng (${fallbackResult.exceptionOrNull()?.message}), giữ nguyên response gốc")
                         }
                     }
                 } else {
