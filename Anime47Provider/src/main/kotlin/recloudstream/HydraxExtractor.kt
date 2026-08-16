@@ -492,7 +492,7 @@ object HydraxInterceptor : Interceptor {
                 .url(segUrl)
                 .header("Referer", "https://abysscdn.com/")
                 .build()
-            return runCatching {
+            val raw = runCatching {
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) {
                         Log.w(TAG, "fetchSegment: segIndex=$index -> HTTP ${resp.code} không thành công, url=$segUrl")
@@ -506,6 +506,83 @@ object HydraxInterceptor : Interceptor {
             }.onFailure { e ->
                 Log.w(TAG, "fetchSegment: segIndex=$index EXCEPTION khi tải segment (url=$segUrl): ${e.message}")
             }.getOrDefault(ByteArray(0))
+
+            // SỬA LỖI (xác nhận qua phân tích file thật tải bằng abyss-dl.jar): ngay
+            // sau khi box "moov" kết thúc, 8 byte header của box "mdat" tiếp theo BỊ
+            // HỎNG ở nguồn Abyss/CDN (size field đọc ra rác dạng ~2 tỷ, type field
+            // không phải "mdat"). Vì tổng độ dài file (totalSize) đã biết trước và
+            // "mdat" luôn kéo dài từ ngay sau nó tới hết file, ta có thể tự tính lại
+            // size đúng = totalSize - offsetOfMdatHeader và ghi đè 8 byte header đó
+            // NGAY KHI segment 0 vừa tải về — chỉ chạy đúng 1 lần trên segment chứa
+            // ranh giới moov->mdat, không đụng tới byte dữ liệu media nào khác.
+            if (index == 0) {
+                patchCorruptMdatHeaderIfNeeded(raw)
+            }
+            return raw
+        }
+
+        /**
+         * Dò box top-level "moov" bắt đầu ngay sau "ftyp" ở đầu segment 0, tính vị trí
+         * kết thúc của nó (= vị trí box "mdat" phải bắt đầu), rồi kiểm tra 8 byte tại đó:
+         * nếu type field KHÔNG phải "mdat" hợp lệ (dấu hiệu hỏng), ghi đè lại đúng
+         * [size 32-bit][mdat] với size = totalSize - offset. Sửa in-place trên mảng byte
+         * truyền vào (an toàn vì ByteArray là mutable, không cần copy).
+         */
+        private fun patchCorruptMdatHeaderIfNeeded(seg0: ByteArray) {
+            if (seg0.size < 32) return
+            try {
+                // ftyp phải nằm ở offset 0
+                val ftypSize = readUInt32BE(seg0, 0)
+                val ftypType = String(seg0, 4, 4, Charsets.US_ASCII)
+                if (ftypType != "ftyp" || ftypSize <= 0 || ftypSize.toInt() + 8 > seg0.size) return
+
+                val moovOffset = ftypSize.toInt()
+                val moovSize = readUInt32BE(seg0, moovOffset)
+                val moovType = String(seg0, moovOffset + 4, 4, Charsets.US_ASCII)
+                if (moovType != "moov" || moovSize <= 0) return
+
+                val mdatHeaderOffset = moovOffset + moovSize.toInt()
+                if (mdatHeaderOffset + 8 > seg0.size) {
+                    Log.d(TAG, "patchCorruptMdatHeaderIfNeeded: mdat header offset=$mdatHeaderOffset vượt quá segment 0 (size=${seg0.size}), bỏ qua (sẽ nằm ở segment sau)")
+                    return
+                }
+
+                val currentType = String(seg0, mdatHeaderOffset + 4, 4, Charsets.US_ASCII)
+                if (currentType == "mdat") {
+                    Log.d(TAG, "patchCorruptMdatHeaderIfNeeded: mdat header tại offset=$mdatHeaderOffset đã hợp lệ, không cần vá")
+                    return
+                }
+
+                val correctMdatSize = totalSize - mdatHeaderOffset
+                if (correctMdatSize <= 8 || correctMdatSize > 0xFFFFFFFFL) {
+                    Log.w(TAG, "patchCorruptMdatHeaderIfNeeded: correctMdatSize=$correctMdatSize không hợp lệ (offset=$mdatHeaderOffset totalSize=$totalSize), bỏ qua vá")
+                    return
+                }
+
+                Log.w(TAG, "patchCorruptMdatHeaderIfNeeded: PHÁT HIỆN mdat header HỎNG tại offset=$mdatHeaderOffset (type đọc được='$currentType') -> VÁ LẠI size=$correctMdatSize type='mdat'")
+
+                writeUInt32BE(seg0, mdatHeaderOffset, correctMdatSize)
+                seg0[mdatHeaderOffset + 4] = 'm'.code.toByte()
+                seg0[mdatHeaderOffset + 5] = 'd'.code.toByte()
+                seg0[mdatHeaderOffset + 6] = 'a'.code.toByte()
+                seg0[mdatHeaderOffset + 7] = 't'.code.toByte()
+            } catch (e: Exception) {
+                Log.w(TAG, "patchCorruptMdatHeaderIfNeeded: EXCEPTION khi vá mdat header: ${e.message}")
+            }
+        }
+
+        private fun readUInt32BE(data: ByteArray, offset: Int): Long {
+            return ((data[offset].toLong() and 0xFF) shl 24) or
+                ((data[offset + 1].toLong() and 0xFF) shl 16) or
+                ((data[offset + 2].toLong() and 0xFF) shl 8) or
+                (data[offset + 3].toLong() and 0xFF)
+        }
+
+        private fun writeUInt32BE(data: ByteArray, offset: Int, value: Long) {
+            data[offset] = ((value shr 24) and 0xFF).toByte()
+            data[offset + 1] = ((value shr 16) and 0xFF).toByte()
+            data[offset + 2] = ((value shr 8) and 0xFF).toByte()
+            data[offset + 3] = (value and 0xFF).toByte()
         }
 
         private fun tokenFor(path: String): String {
