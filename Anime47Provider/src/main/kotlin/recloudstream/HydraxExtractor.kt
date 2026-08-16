@@ -365,7 +365,15 @@ object HydraxInterceptor : Interceptor {
         val (start, endInclusive) = parseRange(rangeHeader, size)
         if (start > endInclusive || start < 0) {
             Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
-            return errorResponse(request, 416, "Invalid range")
+            // SỬA LỖI (xác nhận qua log thực tế: Kanefusa | HY 720p — player gửi Range
+            // start=2222032263, vượt xa size=206394889 thật của file, rơi vào nhánh
+            // này). Response 416 cũ trả về KHÔNG có header "Content-Range", vi phạm RFC
+            // 7233 §4.4 (416 PHẢI có "Content-Range: bytes */<độ_dài_thật>" để client
+            // biết độ dài thật của resource mà tự điều chỉnh lại vị trí seek). Thiếu
+            // header này khiến OkHttp/ExoPlayer không có cách nào phục hồi sau 1 lần
+            // seek quá đà — coi đây là lỗi chí mạng và dừng hẳn stream thay vì chỉ lùi
+            // lại vị trí seek hợp lệ gần nhất rồi phát tiếp bình thường.
+            return errorResponse(request, 416, "Range Not Satisfiable", extraHeaders = mapOf("Content-Range" to "bytes */$size"))
         }
 
         val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, size, start, endInclusive)
@@ -401,14 +409,20 @@ object HydraxInterceptor : Interceptor {
         return start to minOf(end, totalSize - 1)
     }
 
-    private fun errorResponse(request: Request, code: Int, message: String): Response {
-        return Response.Builder()
+    private fun errorResponse(
+        request: Request,
+        code: Int,
+        message: String,
+        extraHeaders: Map<String, String> = emptyMap()
+    ): Response {
+        val builder = Response.Builder()
             .request(request)
             .protocol(Protocol.HTTP_1_1)
             .code(code)
             .message(message)
             .body("".toResponseBody(null))
-            .build()
+        extraHeaders.forEach { (k, v) -> builder.header(k, v) }
+        return builder.build()
     }
 
     /** Lazily fetches 2MB Abyss segments as the player consumes bytes, one segment ahead at most. */
