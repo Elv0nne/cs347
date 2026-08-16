@@ -315,7 +315,11 @@ class Anime47Provider : MainAPI() {
         }
     }
 
-    private fun findMpegTsOffset(data: ByteArray): Int {
+    // internal (thay vì private): cho phép unit test gọi trực tiếp hàm này từ module
+    // test cùng package "recloudstream" mà không cần khởi tạo toàn bộ Provider/Android
+    // framework — xem Anime47ProviderTest.kt. Không mở rộng ra ngoài package nên vẫn an
+    // toàn về mặt API công khai của plugin.
+    internal fun findMpegTsOffset(data: ByteArray): Int {
         val packetSize = 188
         val minLen = packetSize * 3
         if (data.size < minLen) return -1
@@ -1094,8 +1098,30 @@ class Anime47Provider : MainAPI() {
             // (WebView thật, mang đúng TLS/HTTP fingerprint trình duyệt) để thử lấy lại
             // đúng nội dung, giữ request gốc + response gốc làm phương án cuối nếu
             // fallback cũng thất bại.
+            // THEO DÕI ỔN ĐỊNH DÀI HẠN: mốc thời gian bắt đầu để đo processingMs cho riêng
+            // phần xử lý CDN nonprofit.asia bên dưới (không tính thời gian chain.proceed()
+            // gốc, vì đó là thời gian mạng thật ngoài tầm kiểm soát của interceptor này) —
+            // xem StreamHealthStats.maybeLogSummary().
+            val interceptorStartMs = System.currentTimeMillis()
+            StreamHealthStats.segmentsSeen.incrementAndGet()
+
+            // THEO DÕI ỔN ĐỊNH DÀI HẠN: mốc thời gian bắt đầu để đo processingMs cho riêng
+            // phần xử lý CDN nonprofit.asia bên dưới (không tính thời gian chain.proceed()
+            // gốc, vì đó là thời gian mạng thật ngoài tầm kiểm soát của interceptor này) —
+            // xem StreamHealthStats.maybeLogSummary().
+            val interceptorStartMs = System.currentTimeMillis()
+            StreamHealthStats.segmentsSeen.incrementAndGet()
+
+            // THÔNG LƯỢNG (throughput) THEO TỪNG CDN CON: log riêng thời gian chain.proceed()
+            // (thời gian mạng thật, bao gồm cả thời gian server phản hồi header — KHÔNG tính
+            // thời gian đọc body vì response ở đây mới chỉ có header) và host thật
+            // (cdn1..cdn7.nonprofit.asia) để so sánh: nếu 1 CDN con cụ thể luôn chậm hơn hẳn
+            // hoặc hay timeout hơn các CDN khác, sẽ lộ ra qua việc lọc log theo "cdnHost=".
+            val proceedStartMs = System.currentTimeMillis()
             var response = chain.proceed(request)
+            val proceedMs = System.currentTimeMillis() - proceedStartMs
             val requestUrl = request.url.toString()
+            val cdnHost = request.url.host
 
             // CHẨN ĐOÁN (log tổng quát): trước đây interceptor chỉ log khi request khớp
             // cdnFixRegex (domain "nonprofit.asia"), nên nếu segment video thật sự nằm
@@ -1157,7 +1183,8 @@ class Anime47Provider : MainAPI() {
                 return@Interceptor response
             }
 
-            Log.d(TAG, "getVideoInterceptor: nonprofit.asia CDN khớp regex, url=$requestUrl HTTP code=${response.code} Content-Type=${response.header("Content-Type")} Content-Length=${response.header("Content-Length")}")
+            Log.d(TAG, "getVideoInterceptor: nonprofit.asia CDN khớp regex, cdnHost=$cdnHost url=$requestUrl HTTP code=${response.code} Content-Type=${response.header("Content-Type")} Content-Length=${response.header("Content-Length")} thời gian proceed=${proceedMs}ms")
+            StreamHealthStats.recordCdnProceed(cdnHost, proceedMs)
 
             val body = response.body
             if (body == null) {
@@ -1186,11 +1213,57 @@ class Anime47Provider : MainAPI() {
                     peekedBytes += read
                 }
 
-                val peekedHex = headerBuffer.snapshot().let { snapshot ->
+                val peekedSnapshot = headerBuffer.snapshot()
+                val peekedHex = peekedSnapshot.let { snapshot ->
                     (0 until minOf(16, snapshot.size)).joinToString(" ") { "%02x".format(snapshot[it]) }
                 }
+
+                // LOG LỖI (trước đây chỉ log khi mọi thứ suôn sẻ — không có cách nào biết
+                // qua log khi cơ chế giấu file bị đổi mà KHÔNG đọc kỹ từng dòng log offset).
+                // Kiểm tra rõ ràng 2 điều kiện bất thường và log CẢNH BÁO riêng, tách biệt
+                // khỏi dòng log offset thông thường bên dưới, để lọc log theo "PEEK_SHORT"/
+                // "PEEK_BAD_MAGIC" là thấy ngay khi site đổi cấu trúc:
+                if (peekedBytes < TS_SYNC_PEEK_BYTES) {
+                    // Peek đọc được ÍT HƠN cửa sổ mong muốn (65536 byte) — nghĩa là file/
+                    // segment nhỏ hơn cửa sổ peek (bình thường với segment cuối 1 tập, có
+                    // thể ngắn hơn), HOẶC kết nối bị cắt giữa chừng khi đang peek (bất
+                    // thường, đáng nghi mạng chập chờn). Không tự suy luận nguyên nhân ở
+                    // đây (còn phụ thuộc offset tìm được bên dưới có > 0 hay không) — chỉ
+                    // log sự kiện để đối chiếu.
+                    StreamHealthStats.peekShort.incrementAndGet()
+                    Log.w(TAG, "getVideoInterceptor: PEEK_SHORT cdnHost=$cdnHost url=$requestUrl chỉ peek được $peekedBytes/$TS_SYNC_PEEK_BYTES byte mong muốn (thiếu ${TS_SYNC_PEEK_BYTES - peekedBytes} byte) -> có thể segment ngắn hơn cửa sổ peek (bình thường) hoặc kết nối bị cắt giữa chừng (bất thường)")
+                }
+                val pngMagic = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+                val hasPngMagic = peekedSnapshot.size >= pngMagic.size &&
+                    (0 until pngMagic.size).all { peekedSnapshot[it] == pngMagic[it] }
+                if (!hasPngMagic && peekedBytes > 0) {
+                    // Toàn bộ cơ chế "vỏ bọc PNG giả" hiện tại giả định response LUÔN bắt
+                    // đầu bằng magic header PNG chuẩn (dù nội dung thật là TS). Nếu CDN đổi
+                    // sang định dạng vỏ bọc khác (JPEG, WebP, hoặc bỏ hẳn vỏ bọc), magic
+                    // header sẽ không khớp nữa — đây chính là tín hiệu SỚM NHẤT để biết cơ
+                    // chế giấu file đã đổi, sớm hơn cả việc offset lệch khỏi 22610 (vì có
+                    // thể vỏ bọc mới vẫn tình cờ có 0x47 lặp lại ở vị trí khác).
+                    StreamHealthStats.badMagic.incrementAndGet()
+                    Log.w(TAG, "getVideoInterceptor: PEEK_BAD_MAGIC cdnHost=$cdnHost url=$requestUrl 8 byte đầu=[${(0 until minOf(8, peekedSnapshot.size)).joinToString(" ") { "%02x".format(peekedSnapshot[it]) }}] KHÔNG khớp magic header PNG chuẩn [89 50 4e 47 0d 0a 1a 0a] -> cơ chế vỏ bọc có thể đã thay đổi, cần kiểm tra lại")
+                }
+
                 val offset = findMpegTsOffset(headerBuffer.readByteArray())
-                Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl đã peek $peekedBytes byte, 16 byte hex đầu=[$peekedHex], offset đồng bộ tìm được=$offset")
+                Log.d(TAG, "getVideoInterceptor: nonprofit.asia cdnHost=$cdnHost url=$requestUrl đã peek $peekedBytes byte, 16 byte hex đầu=[$peekedHex], offset đồng bộ tìm được=$offset")
+                StreamHealthStats.nonprofitSegments.incrementAndGet()
+                if (offset > 0) {
+                    StreamHealthStats.offsetFoundFirstPeek.incrementAndGet()
+                    StreamHealthStats.recordOffset(offset)
+                    if (offset != EXPECTED_TS_OFFSET) {
+                        // LỆCH OFFSET GIỮA CÁC CDN: log CẢNH BÁO riêng (không chỉ ghi vào
+                        // distinctOffsets âm thầm) ngay tại thời điểm phát hiện, kèm cdnHost
+                        // để biết CDN con nào đang lệch — nếu chỉ 1-2 CDN lệch trong khi các
+                        // CDN khác vẫn đúng 22610, nhiều khả năng là CDN đó đang thử nghiệm
+                        // cấu trúc mới trước khi áp dụng toàn bộ.
+                        Log.w(TAG, "getVideoInterceptor: OFFSET_MISMATCH cdnHost=$cdnHost url=$requestUrl offset=$offset KHÁC với offset mong đợi $EXPECTED_TS_OFFSET -> có thể CDN này đã đổi cấu trúc vỏ bọc PNG giả")
+                    }
+                } else {
+                    StreamHealthStats.offsetZero.incrementAndGet()
+                }
                 if (offset <= 0) {
                     // CHẨN ĐOÁN (phân biệt PNG thật/segment giả trang PNG với trang chặn
                     // Cloudflare): cả 3 loại nội dung đều có thể mang Content-Type:
@@ -1220,6 +1293,7 @@ class Anime47Provider : MainAPI() {
                         asIso.contains(it, ignoreCase = true)
                     }
                     if (looksLikeCloudflareBlock) {
+                        StreamHealthStats.cloudflareBlockSuspected.incrementAndGet()
                         Log.e(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl NGHI VẤN đây là TRANG CHẶN CLOUDFLARE giả dạng Content-Type image/png (tìm thấy chuỗi 'cloudflare'/'blocked'/'<html' trong $peekedBytes byte đầu) -> KHÔNG PHẢI segment video thật, cần xử lý challenge Cloudflare thay vì tìm sync-byte")
                     } else {
                         Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl KHÔNG tìm thấy byte đồng bộ MPEG-TS (0x47) trong $peekedBytes byte đầu, cũng KHÔNG có dấu hiệu trang chặn Cloudflare -> thử fallback qua CloudflareKiller (WebView, fingerprint giống trình duyệt thật) để loại trừ khả năng TLS/HTTP fingerprinting")
@@ -1245,6 +1319,7 @@ class Anime47Provider : MainAPI() {
                     // cần coroutine) — giống chính xác cách HydraxInterceptor.intercept()
                     // ở trên đã làm cho segment Hydrax, thay vì gọi qua app.get().
                     if (!looksLikeCloudflareBlock) {
+                        StreamHealthStats.fallbackTriggered.incrementAndGet()
                         val fallbackResult = runCatching {
                             val fallbackClient = OkHttpClient()
                             val fallbackReq = Request.Builder()
@@ -1264,19 +1339,48 @@ class Anime47Provider : MainAPI() {
                             val fallbackHex = (0 until minOf(16, fallbackBytes.size)).joinToString(" ") { "%02x".format(fallbackBytes[it]) }
                             Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback OkHttp thuần trả về ${fallbackBytes.size} byte, 16 byte hex đầu=[$fallbackHex], offset=$fallbackOffset")
                             if (fallbackOffset > 0) {
+                                StreamHealthStats.fallbackSucceeded.incrementAndGet()
                                 Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback THÀNH CÔNG, tìm thấy segment TS thật -> dùng nội dung fallback thay response gốc")
                                 val trimmed = fallbackBytes.copyOfRange(fallbackOffset, fallbackBytes.size)
                                 val fallbackBody = trimmed.toResponseBody(body.contentType())
+                                StreamHealthStats.totalProcessingMs.addAndGet(System.currentTimeMillis() - interceptorStartMs)
+                                StreamHealthStats.maybeLogSummary(TAG)
                                 return@Interceptor response.newBuilder().body(fallbackBody).build()
                             } else {
+                                StreamHealthStats.fallbackFailed.incrementAndGet()
                                 Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CŨNG không tìm được sync-byte -> đây thực sự là nội dung server trả về (không phải do fingerprinting), giữ nguyên response gốc")
                             }
                         } else {
+                            StreamHealthStats.fallbackFailed.incrementAndGet()
                             Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback thất bại hoặc rỗng (${fallbackResult.exceptionOrNull()?.message}), giữ nguyên response gốc")
                         }
                     }
                 } else {
                     source.skip(offset.toLong())
+
+                    // XÁC MINH SAU KHI CẮT OFFSET (điểm còn thiếu trước đây — code chỉ tìm
+                    // offset trong CỬA SỔ ĐÃ PEEK rồi tin tưởng phần còn lại của TOÀN BỘ
+                    // segment là TS thật, không kiểm tra lại byte đầu tiên NGAY SAU skip có
+                    // đúng 0x47 hay không). Dùng peek() 1 byte không tiêu thụ (an toàn, không
+                    // ảnh hưởng dữ liệu source thật sẽ trả cho player) để xác nhận điểm cắt
+                    // đúng. Đây KHÔNG đảm bảo TOÀN BỘ phần còn lại của segment hợp lệ (188
+                    // byte tiếp theo có thể vẫn lỗi giữa chừng nếu server trả dữ liệu hỏng ở
+                    // đâu đó xa hơn cửa sổ peek 64KB) — chỉ xác nhận điểm ghép nối tại offset
+                    // là đúng, nhưng đây là nơi dễ sai nhất (do offset tính sai/off-by-one)
+                    // nên verify được điểm này giảm phần lớn rủi ro.
+                    val verifyByte = runCatching {
+                        val verifyPeek = source.peek()
+                        val verifyBuffer = Buffer()
+                        if (verifyPeek.read(verifyBuffer, 1L) == 1L) verifyBuffer.readByteArray()[0] else null
+                    }.getOrNull()
+                    if (verifyByte != null && verifyByte != 0x47.toByte()) {
+                        StreamHealthStats.offsetVerifyFailed.incrementAndGet()
+                        Log.e(TAG, "getVideoInterceptor: OFFSET_VERIFY_FAILED cdnHost=$cdnHost url=$requestUrl sau khi skip($offset) byte đầu tiên = 0x${"%02x".format(verifyByte.toInt() and 0xFF)} (mong đợi 0x47) -> điểm cắt SAI, segment gửi cho player có thể bị lỗi/hỏng khung hình dù offset tìm được ban đầu > 0")
+                    } else if (verifyByte == null) {
+                        Log.w(TAG, "getVideoInterceptor: OFFSET_VERIFY_EOF cdnHost=$cdnHost url=$requestUrl sau khi skip($offset) không còn byte nào để verify (source đã hết) -> offset có thể lớn hơn kích thước segment thật")
+                    } else {
+                        StreamHealthStats.offsetVerifyOk.incrementAndGet()
+                    }
                 }
 
                 val originalLength = body.contentLength()
@@ -1299,11 +1403,18 @@ class Anime47Provider : MainAPI() {
                         responseBuilder.removeHeader("Content-Length")
                     }
                 }
+                StreamHealthStats.totalProcessingMs.addAndGet(System.currentTimeMillis() - interceptorStartMs)
+                StreamHealthStats.maybeLogSummary(TAG)
+                val totalMs = System.currentTimeMillis() - interceptorStartMs
+                Log.d(TAG, "getVideoInterceptor: THROUGHPUT cdnHost=$cdnHost offset=$offset contentLength=$fixedLength thời gian proceed=${proceedMs}ms tổng xử lý interceptor=${totalMs}ms")
                 responseBuilder.build()
             } catch (e: IOException) {
                 // Đọc/skip source thất bại giữa chừng (mạng gián đoạn): trả lỗi gốc cho
                 // player xử lý (retry/next server) thay vì làm crash luồng phát video.
-                Log.e(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl IOException khi đọc/skip source: ${e.message}", e)
+                StreamHealthStats.ioExceptions.incrementAndGet()
+                StreamHealthStats.totalProcessingMs.addAndGet(System.currentTimeMillis() - interceptorStartMs)
+                StreamHealthStats.maybeLogSummary(TAG)
+                Log.e(TAG, "getVideoInterceptor: nonprofit.asia cdnHost=$cdnHost url=$requestUrl IOException khi đọc/skip source: ${e.message}", e)
                 response
             }
         }
@@ -1356,6 +1467,87 @@ class Anime47Provider : MainAPI() {
         fun invalidateCachedSession() {
             sharedCachedToken.set(null)
         }
+
+        // THEO DÕI ỔN ĐỊNH DÀI HẠN: getVideoInterceptor() chạy trên nhiều thread OkHttp
+        // song song (nhiều segment/nhiều tập tải cùng lúc), nên mọi counter dùng để đo độ
+        // ổn định qua thời gian PHẢI là AtomicLong/AtomicInteger — biến Int/Long thường sẽ
+        // bị mất update do race condition giữa các thread. object riêng (thay vì field rời
+        // rạc) để gom toàn bộ số liệu 1 chỗ, dễ log định kỳ và dễ xoá/reset khi cần (vd.
+        // debug) mà không đụng vào các biến khác của companion object.
+        internal object StreamHealthStats {
+            val segmentsSeen = java.util.concurrent.atomic.AtomicLong(0)
+            val nonprofitSegments = java.util.concurrent.atomic.AtomicLong(0)
+            val offsetFoundFirstPeek = java.util.concurrent.atomic.AtomicLong(0)
+            val offsetZero = java.util.concurrent.atomic.AtomicLong(0)
+            // Ghi lại MỌI giá trị offset khác 22610 từng thấy (bounded — xem MAX_DISTINCT_OFFSETS)
+            // để phát hiện sớm nếu CDN đổi kích thước "vỏ bọc" PNG giả theo thời gian, đúng
+            // như phần đã xảy ra 1 lần trước đây (188*32 -> 22610, xem ghi chú TS_SYNC_PEEK_BYTES).
+            val distinctOffsets = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.atomic.AtomicLong>()
+            val cloudflareBlockSuspected = java.util.concurrent.atomic.AtomicLong(0)
+            val fallbackTriggered = java.util.concurrent.atomic.AtomicLong(0)
+            val fallbackSucceeded = java.util.concurrent.atomic.AtomicLong(0)
+            val fallbackFailed = java.util.concurrent.atomic.AtomicLong(0)
+            val ioExceptions = java.util.concurrent.atomic.AtomicLong(0)
+            val peekShort = java.util.concurrent.atomic.AtomicLong(0)
+            val badMagic = java.util.concurrent.atomic.AtomicLong(0)
+            // Xác minh SAU khi skip(offset): byte tiếp theo có thật sự là 0x47 hay không —
+            // xem điểm verify trong getVideoInterceptor(). offsetVerifyFailed > 0 nghĩa là đã
+            // từng gửi cho player 1 segment có điểm cắt sai (nội dung hỏng), dù offset ban
+            // đầu tìm được > 0 (tức KHÔNG bị bắt bởi offsetZero/OFFSET_MISMATCH).
+            val offsetVerifyOk = java.util.concurrent.atomic.AtomicLong(0)
+            val offsetVerifyFailed = java.util.concurrent.atomic.AtomicLong(0)
+            val totalProcessingMs = java.util.concurrent.atomic.AtomicLong(0)
+            // Throughput theo từng CDN con (cdn1..cdn7.nonprofit.asia): tổng ms proceed +
+            // số segment, để tính trung bình riêng cho mỗi host khi log summary — giúp phát
+            // hiện nếu 1 CDN con cụ thể luôn chậm/hay lỗi hơn các CDN còn lại.
+            val perCdnProceedMs = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()
+            val perCdnCount = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()
+            private const val MAX_DISTINCT_OFFSETS = 20
+            private const val LOG_EVERY_N_SEGMENTS = 25L
+
+            fun recordOffset(offset: Int) {
+                if (offset != EXPECTED_TS_OFFSET && distinctOffsets.size < MAX_DISTINCT_OFFSETS) {
+                    distinctOffsets.getOrPut(offset) { java.util.concurrent.atomic.AtomicLong(0) }.incrementAndGet()
+                }
+            }
+
+            fun recordCdnProceed(cdnHost: String, proceedMs: Long) {
+                perCdnProceedMs.getOrPut(cdnHost) { java.util.concurrent.atomic.AtomicLong(0) }.addAndGet(proceedMs)
+                perCdnCount.getOrPut(cdnHost) { java.util.concurrent.atomic.AtomicLong(0) }.incrementAndGet()
+            }
+
+            /** Gọi sau mỗi segment nonprofit.asia xử lý xong; tự log tổng hợp mỗi N segment. */
+            fun maybeLogSummary(tag: String) {
+                val n = nonprofitSegments.get()
+                if (n > 0 && n % LOG_EVERY_N_SEGMENTS == 0L) {
+                    val avgMs = if (n > 0) totalProcessingMs.get() / n else 0
+                    val perCdnSummary = perCdnCount.entries.joinToString { (host, count) ->
+                        val c = count.get()
+                        val avg = if (c > 0) (perCdnProceedMs[host]?.get() ?: 0) / c else 0
+                        "$host(n=$c,tb=${avg}ms)"
+                    }
+                    Log.d(
+                        tag,
+                        "StreamHealthStats: tổng hợp sau $n segment nonprofit.asia " +
+                            "(tổng ${segmentsSeen.get()} request qua interceptor) -> " +
+                            "offsetFoundFirstPeek=${offsetFoundFirstPeek.get()}, offsetZero=${offsetZero.get()}, " +
+                            "distinctOffsetsLạKhácThường=${distinctOffsets.entries.joinToString { (k, v) -> "$k×${v.get()}" }}, " +
+                            "peekShort=${peekShort.get()}, badMagic=${badMagic.get()}, " +
+                            "offsetVerify=${offsetVerifyOk.get()} OK / ${offsetVerifyFailed.get()} SAI, " +
+                            "cloudflareBlockSuspected=${cloudflareBlockSuspected.get()}, " +
+                            "fallbackTriggered=${fallbackTriggered.get()} (thành công=${fallbackSucceeded.get()}, thất bại=${fallbackFailed.get()}), " +
+                            "ioExceptions=${ioExceptions.get()}, thời gian xử lý TB=${avgMs}ms/segment, " +
+                            "throughput theo CDN=[$perCdnSummary]"
+                    )
+                }
+            }
+        }
+
+        // Offset "vỏ bọc" PNG giả cố định đã quan sát thực tế (xem ghi chú tại
+        // TS_SYNC_PEEK_BYTES). Dùng làm mốc so sánh trong StreamHealthStats — nếu CDN đổi
+        // giá trị này, distinctOffsets sẽ bắt đầu ghi nhận offset mới và lộ ra qua log
+        // summary, giúp phát hiện sớm thay vì chỉ nhận ra khi player lại bắt đầu lỗi.
+        internal const val EXPECTED_TS_OFFSET = 22610
     }
     // ===================== Data classes (API models) =====================
 
