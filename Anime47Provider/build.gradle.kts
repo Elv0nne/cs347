@@ -38,4 +38,11 @@ dependencies {
        implementation("androidx.preference:preference-ktx:1.2.1")
        implementation("androidx.appcompat:appcompat:1.6.1")
        implementation("androidx.fragment:fragment-ktx:1.6.2")
+
+       // Unit test cho các hàm logic thuần (vd. findMpegTsOffset) — xem
+       // src/test/kotlin/recloudstream/Anime47ProviderTest.kt. Nếu Anime47Provider()
+       // không khởi tạo được trong JVM test thuần do phụ thuộc android.util.Log/Context,
+       // cân nhắc thêm testImplementation("org.robolectric:robolectric:4.11.1") — xem ghi
+       // chú "MOCKING ANDROID" ở cuối file test.
+       testImplementation("junit:junit:4.13.2")
 }
