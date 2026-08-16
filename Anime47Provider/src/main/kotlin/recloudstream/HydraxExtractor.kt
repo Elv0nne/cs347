@@ -362,30 +362,24 @@ object HydraxInterceptor : Interceptor {
         }
 
         val rangeHeader = request.header("Range")
-        var (start, endInclusive) = parseRange(rangeHeader, size)
+        val (start, endInclusive) = parseRange(rangeHeader, size)
 
-        // SỬA LỖI (xác nhận qua log thực tế: Kanefusa | HY 720p — player gửi Range
-        // start=2222032263, vượt xa size=206394889 thật của file). Trả 416 (kể cả có
-        // Content-Range đúng chuẩn RFC 7233) vẫn KHÔNG đủ: nhiều bản ExoPlayer coi bất
-        // kỳ response non-2xx nào từ nguồn dữ liệu là lỗi chí mạng và dừng hẳn, không
-        // tự động lùi seek lại rồi thử lại. Vì vậy khi start nằm ngoài file, thay vì
-        // báo lỗi, ta CLAMP start về byte hợp lệ cuối cùng (size-1) và vẫn trả 206 với
-        // Content-Range đúng vị trí thật — player nhận được dữ liệu (dù không đúng vị
-        // trí nó yêu cầu), thấy Content-Range thực tế trong response, và tự điều chỉnh
-        // nội bộ thay vì crash stream. Chỉ start<0 mới thực sự không hợp lệ (không thể
-        // clamp một cách có ý nghĩa) nên vẫn trả 416 cho trường hợp đó.
-        if (start < 0) {
-            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ (start<0) start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
+        // SỬA LỖI vòng 2 (xác nhận qua log thực tế mới nhất): bản CLAMP trước đó (trả
+        // 206 với start bị kẹp về size-1) làm ExoPlayer LẶP VÔ HẠN thay vì crash: nó
+        // gửi lại đúng request "Range: bytes=2222032263-" nhiều lần liên tiếp (có
+        // backoff tăng dần: 0.13s -> 1.1s -> 2.1s...) mà không bao giờ tiến lên. Lý do:
+        // response Content-Range trả về "bytes 206394888-206394888/206394889" không
+        // khớp với start=2222032263 mà nó yêu cầu, nên ExoPlayer coi response là không
+        // đáng tin và không cập nhật lại vị trí đọc nội bộ, cứ thế lặp lại request cũ.
+        //
+        // Quay lại trả 416 (đúng hành vi mà DefaultHttpDataSource/ProgressiveMediaPeriod
+        // của ExoPlayer được thiết kế để xử lý khi Mp4Extractor scan-seek tìm moov atom
+        // vượt quá cuối file thật): 416 kèm "Content-Range: bytes */<size>" là tín hiệu
+        // chuẩn RFC 7233 để client biết ngay kích thước thật của resource và tự dừng
+        // scan/lùi lại, thay vì nhận 206 với dữ liệu ở vị trí "lạ" rồi bị bối rối.
+        if (start > endInclusive || start < 0) {
+            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
             return errorResponse(request, 416, "Range Not Satisfiable", extraHeaders = mapOf("Content-Range" to "bytes */$size"))
-        }
-        if (start >= size) {
-            val clampedStart = size - 1
-            Log.w(TAG, "intercept: CLAMP - start=$start vượt quá size=$size (player seek quá đà), lùi về clampedStart=$clampedStart rangeHeader=$rangeHeader")
-            start = clampedStart
-            endInclusive = size - 1
-        } else if (start > endInclusive) {
-            Log.w(TAG, "intercept: CLAMP - endInclusive=$endInclusive < start=$start, đặt lại endInclusive=size-1 size=$size rangeHeader=$rangeHeader")
-            endInclusive = size - 1
         }
 
         val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, size, start, endInclusive)
@@ -432,6 +426,12 @@ object HydraxInterceptor : Interceptor {
             .protocol(Protocol.HTTP_1_1)
             .code(code)
             .message(message)
+            // SỬA LỖI: thêm "Content-Length: 0" tường minh. DefaultHttpDataSource của
+            // ExoPlayer parse Content-Length khi mở connection; thiếu header này với
+            // response 416/không có body có thể khiến nó không nhận diện đúng response
+            // là "hoàn chỉnh, không có dữ liệu" trước khi đọc "Content-Range" để suy ra
+            // kích thước thật, dẫn tới xử lý sai luồng lỗi 416 phía trên.
+            .header("Content-Length", "0")
             .body("".toResponseBody(null))
         extraHeaders.forEach { (k, v) -> builder.header(k, v) }
         return builder.build()
