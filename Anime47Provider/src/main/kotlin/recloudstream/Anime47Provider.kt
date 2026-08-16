@@ -252,6 +252,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             Log.w(TAG, "onWatchProgress: không parse được data='$data' thành episodeId: ${e.message}")
             null
         } ?: return
+        val resolvedEpisodeId: Int = episodeId
 
         val progressSeconds = (positionMs / 1000L).toInt()
         if (progressSeconds <= 0) return // chưa xem gì đáng kể, không cần báo
@@ -263,11 +264,11 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         // hủy lan truyền đúng thay vì bị nuốt bởi catch(e: Exception) thông thường.
         catchNonCancellation({
             watchProgressMutex.withLock {
-                postWatchProgress(episodeId, progressSeconds, forceRefresh = false)
+                postWatchProgress(resolvedEpisodeId, progressSeconds, forceRefresh = false)
             }
         }, onError = { e ->
             // Best effort: lỗi mạng/token không được làm gián đoạn playback.
-            Log.w(TAG, "onWatchProgress: LỖI episodeId=$episodeId: ${e.message}")
+            Log.w(TAG, "onWatchProgress: LỖI episodeId=$resolvedEpisodeId: ${e.message}")
         })
     }
 
