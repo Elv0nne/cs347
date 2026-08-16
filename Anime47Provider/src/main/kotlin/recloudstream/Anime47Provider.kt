@@ -1105,13 +1105,6 @@ class Anime47Provider : MainAPI() {
             val interceptorStartMs = System.currentTimeMillis()
             StreamHealthStats.segmentsSeen.incrementAndGet()
 
-            // THEO DÕI ỔN ĐỊNH DÀI HẠN: mốc thời gian bắt đầu để đo processingMs cho riêng
-            // phần xử lý CDN nonprofit.asia bên dưới (không tính thời gian chain.proceed()
-            // gốc, vì đó là thời gian mạng thật ngoài tầm kiểm soát của interceptor này) —
-            // xem StreamHealthStats.maybeLogSummary().
-            val interceptorStartMs = System.currentTimeMillis()
-            StreamHealthStats.segmentsSeen.incrementAndGet()
-
             // THÔNG LƯỢNG (throughput) THEO TỪNG CDN CON: log riêng thời gian chain.proceed()
             // (thời gian mạng thật, bao gồm cả thời gian server phản hồi header — KHÔNG tính
             // thời gian đọc body vì response ở đây mới chỉ có header) và host thật
