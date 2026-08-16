@@ -1327,9 +1327,21 @@ class Anime47Provider : MainAPI() {
         // getVideoInterceptor().
         private val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
 
-        // Cửa sổ "peek" đủ rộng (~32 gói TS = ~6KB) để tìm byte đồng bộ MPEG-TS (0x47)
-        // mà không cần đọc toàn bộ file — phần rác thường chỉ nằm ở vài trăm byte đầu.
-        private const val TS_SYNC_PEEK_BYTES = 188L * 32
+        // SỬA LỖI (root cause thật sự: cửa sổ peek quá nhỏ, không phải TLS
+        // fingerprinting): log thực tế cho thấy offset đồng bộ MPEG-TS thật của mọi
+        // segment CDN nonprofit.asia LUÔN LÀ 22610 byte — cố định tuyệt đối bất kể kích
+        // thước file (594KB tới 8.9MB), tức đây là kích thước MỘT LỚP "VỎ BỌC" PNG giả
+        // cố định mà CDN dùng để che giấu segment TS thật, không phải ảnh PNG ngẫu
+        // nhiên hay trang chặn Cloudflare. Cửa sổ peek cũ (6016 byte = 188*32, kích
+        // thước 1 segment TS "sạch" điển hình) quá nhỏ so với 22610 byte của vỏ bọc
+        // này -> luôn tìm KHÔNG THẤY sync-byte ở lần peek đầu, phải trông cậy vào
+        // fallback (tải lại toàn bộ segment lần 2, tốn gấp đôi băng thông mỗi segment)
+        // mới tìm được. Tăng ngưỡng lên 64KB — đủ dư so với 22610 byte đã quan sát, có
+        // biên độ an toàn nếu CDN đổi kích thước vỏ theo thời gian — để lần peek ĐẦU
+        // TIÊN đã xử lý được ngay, không cần phụ thuộc fallback cho trường hợp phổ biến
+        // này nữa (fallback vẫn được GIỮ NGUYÊN làm phương án dự phòng cuối cho các case
+        // hiếm mà vỏ bọc còn dài hơn cả ngưỡng mới).
+        private const val TS_SYNC_PEEK_BYTES = 65536L
 
         // HIỆU NĂNG: biên dịch 1 lần duy nhất thay vì mỗi lần gọi load() (tức mỗi lần
         // người dùng mở 1 trang chi tiết phim).
