@@ -28,6 +28,7 @@ import com.lagradost.cloudstream3.newAnimeLoadResponse
 import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.WatchProgressListener
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -92,7 +93,7 @@ private fun toJson(value: Any?): String {
     }
 }
 
-class Anime47Provider : MainAPI() {
+class Anime47Provider : MainAPI(), WatchProgressListener {
 
     // TAG dùng để lọc log riêng cho provider này, vd:
     //   adb logcat -s Anime47Provider:V
@@ -150,18 +151,29 @@ class Anime47Provider : MainAPI() {
     // "$apiBaseUrl/dcc/watch-progress", được web gọi lặp lại mỗi ~30 giây trong lúc
     // phát với { episode_id, progress_seconds, seconds_watched: 30 }, và server chỉ
     // thưởng điểm khi progress_seconds tích lũy đạt khoảng ~80% thời lượng tập.
-    // Cloudstream's loadLinks() không có cách nào biết chính xác player đang phát
-    // đến giây thứ mấy hoặc user có thực sự đang xem hay không (không có hook theo
-    // dõi tiến trình phát từ phía provider). Vì việc gọi watch-progress đòi hỏi báo
-    // cáo thời lượng xem thực tế, ta KHÔNG giả lập heartbeat này ở đây — làm vậy sẽ
-    // là gửi dữ liệu "đã xem" không có thật lên server. Do đó điểm DCC theo thời
-    // gian xem sẽ KHÔNG được cộng tự động qua app; user vẫn cần xem qua web thật để
-    // nhận điểm đó. Phần dưới đây chỉ xử lý điểm danh + lưu lịch sử, là 2 hành vi
-    // phản ánh đúng thực tế thao tác của user trên app.
     //
-    // Cả hai request đều "best effort": lỗi mạng/hết hạn token không được throw ra
-    // ngoài, để không làm gián đoạn việc xem phim nếu hệ thống điểm gặp sự cố.
+    // CẬP NHẬT: trước đây Cloudstream's loadLinks() không có cách nào biết chính xác
+    // player đang phát đến giây thứ mấy hoặc user có thực sự đang xem hay không, nên
+    // watch-progress không được gọi (xem lịch sử git). App hiện đã có hook thật từ
+    // player (interface WatchProgressListener trong module library, được
+    // GeneratorPlayer.kt gọi định kỳ mỗi ~15s trong lúc video ĐANG THỰC SỰ playing,
+    // cộng thêm 1 lần bắt buộc khi vị trí đạt ≥95% thời lượng để không bỏ lỡ report
+    // cuối trước khi tập kết thúc). Vì đây là vị trí phát thật (đọc trực tiếp từ
+    // ExoPlayer), việc forward nó qua onWatchProgress() bên dưới không phải giả lập —
+    // nó phản ánh đúng những gì user đang thực sự xem, tương đương hành vi heartbeat
+    // của web thật. Xem implementation ở cuối file (onWatchProgress).
+    //
+    // Cả hai request (điểm danh, lưu lịch sử) đều "best effort": lỗi mạng/hết hạn
+    // token không được throw ra ngoài, để không làm gián đoạn việc xem phim nếu hệ
+    // thống điểm gặp sự cố.
     private val dailyCheckinDone = AtomicBoolean(false)
+
+    // Chặn watch-progress request chồng chéo cho CÙNG 1 episode: GeneratorPlayer đã tự
+    // throttle ở phía nó (15s / near-end), nhưng thêm 1 lớp mutex-per-call ở đây để
+    // đảm bảo 2 lần gọi onWatchProgress() rất sát nhau (vd. do nhiều episode trong
+    // cùng 1 batch loadLinks trước đó, hoặc app gọi lại khi resume) không tạo ra 2
+    // request POST song song race nhau tới cùng backend cho cùng 1 episode_id.
+    private val watchProgressMutex = Mutex()
 
     // Lưu ý: hai hàm dưới đây (triggerDailyCheckinOnce, markEpisodeWatched) chỉ được gọi
     // qua "backgroundScope.launch { ... }" (xem getMainPage()/loadEpisodeStreams()), tức
@@ -211,6 +223,82 @@ class Anime47Provider : MainAPI() {
         } catch (e: Exception) {
             // Best effort: không làm gián đoạn việc phát video nếu báo điểm thất bại
         }
+    }
+
+    // SỬA LỖI/TÍNH NĂNG MỚI (cộng điểm DCC theo thời gian xem thật qua app): implement
+    // WatchProgressListener.onWatchProgress(), được GeneratorPlayer.kt gọi định kỳ với
+    // vị trí phát THẬT đọc trực tiếp từ ExoPlayer (xem ghi chú tại dailyCheckinDone ở
+    // trên). "data" ở đây chính là cùng 1 chuỗi mà loadLinks(data, ...) nhận được cho
+    // episode đang phát — parse giống hệt cách loadLinks() đã làm để lấy episode_id.
+    //
+    // Trường hợp "data" là một mảng nhiều episode_id (xem loadLinks: data.startsWith("["))
+    // xảy ra khi provider gộp nhiều tập vào 1 lần loadLinks (vd. server "phát liên tục" trả
+    // về nhiều nguồn cho nhiều tập cùng lúc) — nhưng người dùng tại một thời điểm chỉ đang
+    // thực sự xem 1 tập. Không có cách nào từ vị trí phát đơn lẻ suy ra CHÍNH XÁC tập nào
+    // trong danh sách đó đang hiển thị, nên trong trường hợp này ta lấy phần tử ĐẦU TIÊN
+    // (tập được nạp trước, nhiều khả năng nhất là tập đang xem) thay vì báo progress cho
+    // toàn bộ danh sách — báo cho cả danh sách sẽ làm sai lệch progress_seconds của các tập
+    // KHÁC mà user không thực sự xem.
+    override suspend fun onWatchProgress(data: String, positionMs: Long, durationMs: Long) {
+        if (durationMs <= 0L) return // tránh chia cho 0 / dữ liệu duration chưa sẵn sàng
+
+        val episodeId: Int? = try {
+            if (data.startsWith("[")) {
+                mapper.readValue(data, object : TypeReference<List<Int>>() {}).firstOrNull()
+            } else {
+                data.toInt()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "onWatchProgress: không parse được data='$data' thành episodeId: ${e.message}")
+            null
+        } ?: return
+
+        val progressSeconds = (positionMs / 1000L).toInt()
+        if (progressSeconds <= 0) return // chưa xem gì đáng kể, không cần báo
+
+        // SỬA LỖI (structured concurrency): dùng catchNonCancellation() thay vì catch
+        // trần — xem ghi chú đầy đủ tại khai báo hàm helper ở đầu file. Quan trọng ở
+        // đây vì onWatchProgress() được gọi từ ticker của GeneratorPlayer (coroutine có
+        // thể bị hủy khi Fragment destroy/ticker stop giữa chừng), nên phải để tín hiệu
+        // hủy lan truyền đúng thay vì bị nuốt bởi catch(e: Exception) thông thường.
+        catchNonCancellation({
+            watchProgressMutex.withLock {
+                val headers = getAuthHeaders()
+                if (!headers.containsKey("Authorization")) return@withLock // chưa đăng nhập
+
+                val body = toJson(
+                    mapOf(
+                        "episode_id" to episodeId,
+                        "progress_seconds" to progressSeconds,
+                        // Mirror hành vi heartbeat ~30s của web thật (xem ghi chú tại
+                        // dailyCheckinDone) — giá trị cố định 30 khớp với những gì
+                        // DevTools quan sát được từ web, độc lập với chu kỳ ticker thực
+                        // tế phía app (15s) vì server chỉ quan tâm progress_seconds tích
+                        // luỹ, không quan tâm khoảng cách thời gian thật giữa 2 lần gọi.
+                        "seconds_watched" to 30
+                    )
+                ).toRequestBody("application/json".toMediaTypeOrNull())
+
+                app.post(
+                    "$apiBaseUrl/dcc/watch-progress",
+                    headers = headers + mapOf(
+                        "origin" to mainUrl,
+                        "referer" to "$mainUrl/"
+                    ),
+                    requestBody = body,
+                    interceptor = interceptor,
+                    timeout = 10000
+                )
+                Log.d(
+                    TAG,
+                    "onWatchProgress: đã báo episodeId=$episodeId progress_seconds=$progressSeconds " +
+                        "(pos=${positionMs / 1000}s/dur=${durationMs / 1000}s)"
+                )
+            }
+        }, onError = { e ->
+            // Best effort: lỗi mạng/token không được làm gián đoạn playback.
+            Log.w(TAG, "onWatchProgress: LỖI episodeId=$episodeId: ${e.message}")
+        })
     }
 
     // GHI CHÚ BẢO MẬT (không sửa trong bản này để tránh phá vỡ UI cài đặt đang hoạt
@@ -1683,3 +1771,4 @@ class Anime47Provider : MainAPI() {
         val has_more: Boolean?
     )
 }
+ 
