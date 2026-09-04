@@ -59,6 +59,23 @@ object HydraxExtractor {
     private val cloudflareKiller = CloudflareKiller()
     private const val FRAGMENT_SIZE = 2097152L // 2 MiB, must match server-side chunking
     const val RELAY_HOST = "hydrax-relay.internal"
+
+    // HIỆU NĂNG: Log.d/Log.w/Log.e của Android vẫn build chuỗi thông điệp (string
+    // interpolation, hàng chục field mỗi dòng) TRƯỚC KHI kiểm tra xem log có thực sự
+    // được ghi hay không — chi phí CPU đó tồn tại ngay cả trên build release khi log
+    // debug bị lọc ở tầng logger. Trên các hot path chạy MỖI segment/MỖI request
+    // (fetchSegment, SegmentSource.read, HydraxInterceptor.intercept) tần suất gọi có
+    // thể lên tới hàng trăm lần mỗi phút khi phát 1 video — dùng logD/logW với lambda
+    // "message: () -> String" để chuỗi chỉ được build khi Log.isLoggable(TAG, level)
+    // trả về true (mặc định false cho VERBOSE/DEBUG trên thiết bị người dùng thật,
+    // chỉ true khi bật `adb shell setprop log.tag.<TAG> DEBUG` để debug thủ công).
+    private inline fun logD(tag: String, message: () -> String) {
+        if (Log.isLoggable(tag, Log.DEBUG)) Log.d(tag, message())
+    }
+
+    private inline fun logW(tag: String, message: () -> String) {
+        if (Log.isLoggable(tag, Log.WARN)) Log.w(tag, message())
+    }
     // GHI CHÚ: trước đây từng đổi ABYSS_BASE_URL sang "abyssplayer.com" vì test từ máy
     // chủ ở nước ngoài thấy abysscdn.com bị read timeout. Tuy nhiên theo phản hồi thực
     // tế của người dùng: TRƯỚC các commit gần đây, hầu hết server HY vẫn phát được
@@ -86,7 +103,7 @@ object HydraxExtractor {
     fun isHydraxUrl(url: String): Boolean {
         val host = runCatching { URI(url).host }.getOrNull()
         val result = host != null && HY_HOSTS.any { host.contains(it, ignoreCase = true) }
-        Log.d(TAG, "isHydraxUrl: url=$url host=$host -> $result")
+        logD(TAG) { "isHydraxUrl: url=$url host=$host -> $result" }
         return result
     }
 
@@ -171,7 +188,7 @@ object HydraxExtractor {
 
     private fun getVideoId(url: String): String? {
         val host = runCatching { URI(url).host }.getOrNull() ?: return url.also {
-            Log.d(TAG, "getVideoId: không parse được host của url=$url, fallback trả về chính url")
+            logD(TAG) { "getVideoId: không parse được host của url=$url, fallback trả về chính url" }
         }
         val result = when {
             // SỬA LỖI: abyssplayer.com (domain mới thay abysscdn.com) trả videoId ngay
@@ -189,7 +206,7 @@ object HydraxExtractor {
                 }.getOrNull()
             else -> url
         }
-        Log.d(TAG, "getVideoId: url=$url host=$host -> videoId=$result")
+        logD(TAG) { "getVideoId: url=$url host=$host -> videoId=$result" }
         return result
     }
 
@@ -197,7 +214,7 @@ object HydraxExtractor {
         // ĐỔI LẠI: abysscdn.com (domain gốc) dùng dạng query "?v=videoId", khác với
         // dạng path "/videoId" của abyssplayer.com — xem ghi chú tại ABYSS_BASE_URL.
         val embedUrl = "$ABYSS_BASE_URL/?v=$videoId"
-        Log.d(TAG, "fetchMp4Metadata: videoId=$videoId embedUrl=$embedUrl referer=$referer")
+        logD(TAG) { "fetchMp4Metadata: videoId=$videoId embedUrl=$embedUrl referer=$referer" }
 
         val response = app.get(
             embedUrl,
@@ -208,9 +225,9 @@ object HydraxExtractor {
             interceptor = cloudflareKiller,
             timeout = 15000
         )
-        Log.d(TAG, "fetchMp4Metadata: HTTP code=${response.code} successful=${response.isSuccessful}")
+        logD(TAG) { "fetchMp4Metadata: HTTP code=${response.code} successful=${response.isSuccessful}" }
         val html = response.text
-        Log.d(TAG, "fetchMp4Metadata: HTML embed dài ${html.length} ký tự")
+        logD(TAG) { "fetchMp4Metadata: HTML embed dài ${html.length} ký tự" }
 
         val doc = org.jsoup.Jsoup.parse(html)
         val scriptHtml = doc.select("script").map { it.html() }.firstOrNull { it.contains("datas") }
@@ -225,12 +242,12 @@ object HydraxExtractor {
             Log.e(TAG, "fetchMp4Metadata: THẤT BẠI - tìm thấy script chứa 'datas' nhưng regex không khớp được giá trị. scriptHtml (300 ký tự đầu): ${scriptHtml.take(300)}")
             return null
         }
-        Log.d(TAG, "fetchMp4Metadata: tìm thấy 'datas' (base64, dài ${encodedDatas.length} ký tự)")
+        logD(TAG) { "fetchMp4Metadata: tìm thấy 'datas' (base64, dài ${encodedDatas.length} ký tự)" }
 
         val decodedJson = String(Base64.getDecoder().decode(encodedDatas), Charsets.ISO_8859_1)
-        Log.d(TAG, "fetchMp4Metadata: base64-decode datas OK, JSON dài ${decodedJson.length} ký tự")
+        logD(TAG) { "fetchMp4Metadata: base64-decode datas OK, JSON dài ${decodedJson.length} ký tự" }
         val datas = mapper.readValue(decodedJson, Datas::class.java)
-        Log.d(TAG, "fetchMp4Metadata: parse Datas OK -> md5_id=${datas.md5_id} slug=${datas.slug} user_id=${datas.user_id} media_len=${datas.media?.length}")
+        logD(TAG) { "fetchMp4Metadata: parse Datas OK -> md5_id=${datas.md5_id} slug=${datas.slug} user_id=${datas.user_id} media_len=${datas.media?.length}" }
         val encryptedMedia = datas.media
         if (encryptedMedia == null) {
             Log.e(TAG, "fetchMp4Metadata: THẤT BẠI - field 'media' rỗng/null trong datas đã parse")
@@ -239,14 +256,14 @@ object HydraxExtractor {
 
         val mediaKey = keyForString("${datas.user_id}:${datas.slug}:${datas.md5_id}")
         val decryptedJson = aesCtrDecryptFromIso(encryptedMedia, mediaKey)
-        Log.d(TAG, "fetchMp4Metadata: giải mã AES-CTR OK, JSON video dài ${decryptedJson.length} ký tự")
+        logD(TAG) { "fetchMp4Metadata: giải mã AES-CTR OK, JSON video dài ${decryptedJson.length} ký tự" }
         val video = mapper.readValue(decryptedJson, VideoData::class.java)
 
         val result = video.mp4?.copy(slug = datas.slug, md5_id = datas.md5_id)
         if (result == null) {
             Log.e(TAG, "fetchMp4Metadata: THẤT BẠI - field 'mp4' rỗng/null sau khi parse VideoData")
         } else {
-            Log.d(TAG, "fetchMp4Metadata: THÀNH CÔNG -> domains=${result.domains} sources_count=${result.sources?.size} md5_id=${result.md5_id}")
+            logD(TAG) { "fetchMp4Metadata: THÀNH CÔNG -> domains=${result.domains} sources_count=${result.sources?.size} md5_id=${result.md5_id}" }
         }
         return result
     }
@@ -264,7 +281,7 @@ object HydraxExtractor {
         serverName: String?,
         referer: String
     ): List<ExtractorLink> {
-        Log.d(TAG, "getLinks: BẮT ĐẦU streamUrl=$streamUrl providerName=$providerName serverName=$serverName referer=$referer")
+        logD(TAG) { "getLinks: BẮT ĐẦU streamUrl=$streamUrl providerName=$providerName serverName=$serverName referer=$referer" }
 
         val videoId = getVideoId(streamUrl)
         if (videoId == null) {
@@ -291,9 +308,9 @@ object HydraxExtractor {
         }
 
         val sources = mp4.sources?.filterNotNull().orEmpty()
-        Log.d(TAG, "getLinks: md5Id=$md5Id domain=$domain, tổng ${sources.size} sources thô")
+        logD(TAG) { "getLinks: md5Id=$md5Id domain=$domain, tổng ${sources.size} sources thô" }
         if (sources.isEmpty()) {
-            Log.w(TAG, "getLinks: mp4.sources rỗng hoặc toàn null -> sẽ không có link nào được trả về")
+            logW(TAG) { "getLinks: mp4.sources rỗng hoặc toàn null -> sẽ không có link nào được trả về" }
         }
 
         val displayBaseName = serverName?.takeIf { it.isNotBlank() } ?: "$providerName HY"
@@ -303,13 +320,13 @@ object HydraxExtractor {
             val size = source.size
             val resId = source.res_id
             if (sub == null || size == null || resId == null) {
-                Log.w(TAG, "getLinks: bỏ qua source[$index] thiếu field bắt buộc -> sub=$sub size=$size resId=$resId label=${source.label}")
+                logW(TAG) { "getLinks: bỏ qua source[$index] thiếu field bắt buộc -> sub=$sub size=$size resId=$resId label=${source.label}" }
                 return@mapIndexedNotNull null
             }
             val baseUrl = "https://$sub.${domain.substringAfter(".")}"
             val relayUrl = buildRelayUrl(baseUrl, md5Id, resId, size)
             val quality = source.label?.filter { it.isDigit() }?.toIntOrNull() ?: Qualities.Unknown.value
-            Log.d(TAG, "getLinks: source[$index] label=${source.label} quality=$quality baseUrl=$baseUrl relayUrl=$relayUrl size=$size")
+            logD(TAG) { "getLinks: source[$index] label=${source.label} quality=$quality baseUrl=$baseUrl relayUrl=$relayUrl size=$size" }
 
             newExtractorLink(
                 providerName,
@@ -323,7 +340,7 @@ object HydraxExtractor {
             }
         }
 
-        Log.d(TAG, "getLinks: KẾT THÚC - trả về ${links.size}/${sources.size} link hợp lệ cho videoId=$videoId")
+        logD(TAG) { "getLinks: KẾT THÚC - trả về ${links.size}/${sources.size} link hợp lệ cho videoId=$videoId" }
         return links
     }
 
@@ -341,7 +358,70 @@ object HydraxInterceptor : Interceptor {
 
     private const val TAG = "HydraxInterceptor"
     private const val FRAGMENT_SIZE = 2097152L
-    private val client = OkHttpClient()
+
+    // HIỆU NĂNG (lỗi nghiêm trọng nhất tìm được trong toàn bộ plugin): OkHttpClient()
+    // mặc định KHÔNG đặt timeout riêng (connect/read/write mặc định 10s của OkHttp là
+    // ổn, nhưng quan trọng hơn: mỗi lần "OkHttpClient()" được new lên, nó tạo hẳn 1
+    // connection pool + dispatcher/thread pool RIÊNG, không tái sử dụng kết nối TCP/TLS
+    // đã có với CDN Abyss cho các segment TRƯỚC ĐÓ của CÙNG 1 video). Trước đây field
+    // này đã là "val" cấp object (tốt, chỉ tạo 1 lần cho toàn bộ interceptor) — giữ
+    // nguyên đó, nhưng bổ sung timeout tường minh: ExoPlayer có thể mở hàng chục Range
+    // request trong lúc buffer/seek; nếu 1 CDN segment bị treo (không đóng socket,
+    // không trả lỗi) mà không có timeout, connection đó chiếm giữ mãi 1 thread trong
+    // OkHttp dispatcher, dồn lại có thể làm cạn pool và khiến CÁC segment khác (kể cả
+    // của video khác đang xem) cũng bị chặn theo dây chuyền.
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+
+    // SỬA LỖI HIỆU NĂNG NGHIÊM TRỌNG NHẤT trong toàn bộ plugin: trước đây
+    // SegmentSource.init { detectCorrectTotalSize(...) } chạy MỖI LẦN 1 SegmentSource
+    // mới được tạo — tức là MỖI Range request mới mà ExoPlayer gửi tới relay host
+    // (thường xảy ra rất nhiều lần trong 1 lần xem phim: mở luồng ban đầu, mọi lần
+    // seek, mọi lần player mở lại kết nối sau khi buffer đầy rồi rỗng lại...). Hàm này
+    // tự thực hiện 1 HTTP GET ĐỒNG BỘ tải lại TOÀN BỘ segment 0 (tối đa 2MB) chỉvđể dò
+    // xem totalSize khai báo có đúng hay không. Kết quả: với 1 video dài, có thể tải
+    // lại segment 0 (2MB) hàng chục lần một cách vô ích — vừa tốn băng thông gấp nhiều
+    // lần cần thiết, vừa cộng thêm độ trễ mạng thật (1 round-trip + tải 2MB) vào MỌI
+    // request Range, kể cả những request giữa phim không hề liên quan tới segment 0.
+    // Sửa: cache kết quả theo key (baseUrl, md5Id, resId, declaredTotalSize) — bất biến
+    // cho cùng 1 video/nguồn trong suốt phiên phát, nên chỉ cần dò đúng 1 LẦN DUY NHẤT
+    // cho lần Range request đầu tiên; mọi request tiếp theo (kể cả sau khi seek) dùng
+    // lại kết quả đã cache, không gọi mạng thêm lần nào nữa.
+    private val totalSizeCorrectionCache =
+        java.util.concurrent.ConcurrentHashMap<String, Long?>()
+
+    // HIỆU NĂNG: cache nhỏ, bounded, cho các segment 2MB đã tải — xem ghi chú đầy đủ
+    // tại điểm dùng trong SegmentSource.fetchSegment(). Giới hạn số lượng segment giữ
+    // lại (không phải giới hạn theo byte) để đơn giản và đủ tốt: ExoPlayer thường chỉ
+    // seek qua lại trong phạm vi vài segment gần vị trí hiện tại, không cần cache cả
+    // video (sẽ tốn RAM không cần thiết, đặc biệt với video dài nhiều tiếng).
+    // LinkedHashMap với accessOrder=true tự động đưa entry vừa dùng lên cuối, removeEldestEntry
+    // tự xoá entry cũ nhất khi vượt quá SEGMENT_CACHE_MAX_ENTRIES — cho hành vi LRU chuẩn
+    // mà không cần tự triển khai logic đếm/xoá thủ công. Bọc synchronized vì
+    // LinkedHashMap không thread-safe và nhiều Range request có thể đọc/ghi đồng thời
+    // từ các thread khác nhau của OkHttp dispatcher đang phục vụ ExoPlayer.
+    private const val SEGMENT_CACHE_MAX_ENTRIES = 4
+    private val segmentByteCache = object : LinkedHashMap<String, ByteArray>(
+        SEGMENT_CACHE_MAX_ENTRIES, 0.75f, true
+    ) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean {
+            return size > SEGMENT_CACHE_MAX_ENTRIES
+        }
+    }
+
+    // Xem ghi chú logD/logW ở HydraxExtractor — áp dụng cùng nguyên tắc cho
+    // HydraxInterceptor vì SegmentSource.read()/fetchSegment() là hot path chạy mỗi
+    // 2MB segment tải về, tần suất cao hơn hẳn các hàm one-shot khác trong file.
+    private inline fun logD(tag: String, message: () -> String) {
+        if (Log.isLoggable(tag, Log.DEBUG)) Log.d(tag, message())
+    }
+
+    private inline fun logW(tag: String, message: () -> String) {
+        if (Log.isLoggable(tag, Log.WARN)) Log.w(tag, message())
+    }
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -354,7 +434,7 @@ object HydraxInterceptor : Interceptor {
         val resId = request.url.queryParameter("res")?.toIntOrNull()
         val size = request.url.queryParameter("size")?.toLongOrNull()
 
-        Log.d(TAG, "intercept: relay request rangeHeader=${request.header("Range")} base=$baseUrl md5=$md5Id res=$resId size=$size")
+        logD(TAG) { "intercept: relay request rangeHeader=${request.header("Range")} base=$baseUrl md5=$md5Id res=$resId size=$size" }
 
         if (baseUrl == null || md5Id == null || resId == null || size == null) {
             Log.e(TAG, "intercept: THẤT BẠI - thiếu tham số relay bắt buộc (base/md5/res/size), url=${request.url}")
@@ -467,9 +547,22 @@ object HydraxInterceptor : Interceptor {
         private val endByteInclusive: Long
 
         init {
-            val corrected = detectCorrectTotalSize(totalSizeFromMetadata)
+            // HIỆU NĂNG: xem ghi chú đầy đủ tại "totalSizeCorrectionCache" ở
+            // HydraxInterceptor. Key gồm đủ 4 tham số xác định DUY NHẤT 1 nguồn video cụ
+            // thể (baseUrl phụ thuộc sub-CDN, md5Id+resId xác định file, declaredTotalSize
+            // để tự làm mới cache nếu vì lý do nào đó metadata trả về totalSize khác cho
+            // cùng md5Id/resId, dù trường hợp này gần như không xảy ra trong thực tế).
+            // computeIfAbsent() của ConcurrentHashMap đảm bảo dò mạng chỉ chạy đúng 1 lần
+            // ngay cả khi nhiều Range request tới CÙNG segment 0 khởi tạo SegmentSource
+            // gần như đồng thời (vd. ExoPlayer mở nhiều luồng buffer song song lúc bắt
+            // đầu phát) — các request đến sau trong lúc đang dò sẽ đợi ngắn rồi nhận
+            // thẳng kết quả đã tính, không tự dò lại.
+            val cacheKey = "$baseUrl|$md5Id|$resId|$totalSizeFromMetadata"
+            val corrected = totalSizeCorrectionCache.computeIfAbsent(cacheKey) {
+                detectCorrectTotalSize(totalSizeFromMetadata)
+            }
             if (corrected != null && corrected != totalSizeFromMetadata) {
-                Log.w(TAG, "SegmentSource.init: PHÁT HIỆN totalSize từ metadata SAI (metadata=$totalSizeFromMetadata) -> totalSize THẬT=$corrected (chênh lệch=${corrected - totalSizeFromMetadata})")
+                logW(TAG) { "SegmentSource.init: PHÁT HIỆN totalSize từ metadata SAI (metadata=$totalSizeFromMetadata) -> totalSize THẬT=$corrected (chênh lệch=${corrected - totalSizeFromMetadata})" }
                 totalSize = corrected
                 // nếu endByteInclusive trước đó được tính dựa theo size sai (vd = size-1 cho request full),
                 // và nó khớp đúng với totalSizeFromMetadata-1 (nghĩa là player đang xin "toàn bộ file" theo
@@ -526,7 +619,7 @@ object HydraxInterceptor : Interceptor {
                     searchFrom++
                 }
                 if (mdatTypeOffset < 8) {
-                    Log.d(TAG, "detectCorrectTotalSize: không tìm thấy 'mdat' trong segment 0 (có thể mdat nằm ở segment sau, hoặc file không cần sửa)")
+                    logD(TAG) { "detectCorrectTotalSize: không tìm thấy 'mdat' trong segment 0 (có thể mdat nằm ở segment sau, hoặc file không cần sửa)" }
                     return null
                 }
 
@@ -542,19 +635,19 @@ object HydraxInterceptor : Interceptor {
                 if (realTotalSize < declaredTotalSize) {
                     // Nhỏ hơn kích thước khai báo là bất thường/không tin cậy bằng trường hợp
                     // "thiếu đuôi" (lớn hơn) mà ta đã xác nhận qua thực nghiệm; bỏ qua để an toàn.
-                    Log.w(TAG, "detectCorrectTotalSize: realTotalSize=$realTotalSize < declared=$declaredTotalSize, bất thường -> bỏ qua, giữ nguyên")
+                    logW(TAG) { "detectCorrectTotalSize: realTotalSize=$realTotalSize < declared=$declaredTotalSize, bất thường -> bỏ qua, giữ nguyên" }
                     return null
                 }
                 realTotalSize
             } catch (e: Exception) {
-                Log.w(TAG, "detectCorrectTotalSize: EXCEPTION, giữ nguyên totalSize gốc: ${e.message}")
+                logW(TAG) { "detectCorrectTotalSize: EXCEPTION, giữ nguyên totalSize gốc: ${e.message}" }
                 null
             }
         }
 
         override fun read(sink: Buffer, byteCount: Long): Long {
             if (currentPos > endByteInclusive) {
-                Log.d(TAG, "SegmentSource.read: đã đọc hết range (currentPos=$currentPos > endByteInclusive=$endByteInclusive), kết thúc stream")
+                logD(TAG) { "SegmentSource.read: đã đọc hết range (currentPos=$currentPos > endByteInclusive=$endByteInclusive), kết thúc stream" }
                 return -1L
             }
 
@@ -573,7 +666,7 @@ object HydraxInterceptor : Interceptor {
             val remaining = endByteInclusive - currentPos + 1
             val toRead = minOf(byteCount, remaining, currentBuffer.size)
             if (toRead <= 0) {
-                Log.w(TAG, "SegmentSource.read: toRead<=0 (byteCount=$byteCount remaining=$remaining bufferSize=${currentBuffer.size}) tại currentPos=$currentPos, dừng stream")
+                logW(TAG) { "SegmentSource.read: toRead<=0 (byteCount=$byteCount remaining=$remaining bufferSize=${currentBuffer.size}) tại currentPos=$currentPos, dừng stream" }
                 return -1L
             }
             val read = currentBuffer.read(sink, toRead)
@@ -585,10 +678,25 @@ object HydraxInterceptor : Interceptor {
         override fun close() {}
 
         private fun fetchSegment(index: Int): ByteArray {
+            // HIỆU NĂNG: SegmentSource CŨ chỉ giữ 1 buffer cho segment ĐANG đọc — mỗi khi
+            // ExoPlayer đóng connection hiện tại và mở 1 SegmentSource MỚI (Range request
+            // mới), dù request mới trỏ vào ĐÚNG segment index vừa tải trước đó (rất phổ
+            // biến: seek lùi/tiến trong cùng cửa sổ 2MB, hoặc ExoPlayer huỷ + mở lại
+            // connection khi buffer đầy rồi cạn), segment 2MB đó bị tải lại HOÀN TOÀN từ
+            // mạng. Tra cache dùng chung cấp HydraxInterceptor trước (key gồm đủ
+            // baseUrl+md5Id+resId+totalSize+segIndex để không đụng giữa các video/nguồn
+            // khác nhau) — chỉ gọi mạng khi thực sự chưa có trong cache.
+            val cacheKey = "$baseUrl|$md5Id|$resId|$totalSize|$index"
+            val cachedBytes = synchronized(segmentByteCache) { segmentByteCache[cacheKey] }
+            if (cachedBytes != null) {
+                logD(TAG) { "fetchSegment: segIndex=$index CACHE HIT, dùng lại ${cachedBytes.size} byte đã tải trước đó (không gọi mạng)" }
+                return cachedBytes
+            }
+
             val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
             val token = tokenFor(path, totalSize)
             val segUrl = "$baseUrl/sora/$totalSize/$token"
-            Log.d(TAG, "fetchSegment: segIndex=$index md5Id=$md5Id resId=$resId totalSize=$totalSize url=$segUrl")
+            logD(TAG) { "fetchSegment: segIndex=$index md5Id=$md5Id resId=$resId totalSize=$totalSize url=$segUrl" }
             val req = Request.Builder()
                 .url(segUrl)
                 .header("Referer", "https://abysscdn.com/")
@@ -596,16 +704,19 @@ object HydraxInterceptor : Interceptor {
             return runCatching {
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) {
-                        Log.w(TAG, "fetchSegment: segIndex=$index -> HTTP ${resp.code} không thành công, url=$segUrl")
+                        logW(TAG) { "fetchSegment: segIndex=$index -> HTTP ${resp.code} không thành công, url=$segUrl" }
                         ByteArray(0)
                     } else {
                         val bytes = resp.body?.bytes() ?: ByteArray(0)
-                        Log.d(TAG, "fetchSegment: segIndex=$index THÀNH CÔNG, nhận ${bytes.size} byte")
+                        logD(TAG) { "fetchSegment: segIndex=$index THÀNH CÔNG, nhận ${bytes.size} byte" }
+                        if (bytes.isNotEmpty()) {
+                            synchronized(segmentByteCache) { segmentByteCache[cacheKey] = bytes }
+                        }
                         bytes
                     }
                 }
             }.onFailure { e ->
-                Log.w(TAG, "fetchSegment: segIndex=$index EXCEPTION khi tải segment (url=$segUrl): ${e.message}")
+                logW(TAG) { "fetchSegment: segIndex=$index EXCEPTION khi tải segment (url=$segUrl): ${e.message}" }
             }.getOrDefault(ByteArray(0))
         }
 
@@ -645,3 +756,4 @@ object HydraxInterceptor : Interceptor {
         }
     }
 }
+ 
