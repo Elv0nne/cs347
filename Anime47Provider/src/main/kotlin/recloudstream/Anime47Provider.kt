@@ -93,6 +93,21 @@ private fun toJson(value: Any?): String {
     }
 }
 
+// HIỆU NĂNG: Log.d/Log.w của Android build chuỗi thông điệp NGAY LẬP TỨC (string
+// interpolation, thường ghép hàng chục biến mỗi dòng ở file này) trước khi kiểm tra
+// xem log có thực sự được ghi ra hay không — tốn CPU dù build release lọc bỏ log debug
+// ở tầng logger. getVideoInterceptor() chạy trên MỌI segment video tải về trong lúc
+// phát (có thể hàng trăm lần/phút với bitrate cao chia segment nhỏ), nên đây là hot
+// path đáng kể nhất trong toàn bộ plugin. Dùng logD/logW với lambda để chuỗi chỉ được
+// build khi Log.isLoggable(tag, level) trả về true.
+private inline fun logD(tag: String, message: () -> String) {
+    if (Log.isLoggable(tag, Log.DEBUG)) Log.d(tag, message())
+}
+
+private inline fun logW(tag: String, message: () -> String) {
+    if (Log.isLoggable(tag, Log.WARN)) Log.w(tag, message())
+}
+
 class Anime47Provider : MainAPI(), WatchProgressListener {
 
     // TAG dùng để lọc log riêng cho provider này, vd:
@@ -249,7 +264,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 data.toInt()
             }
         } catch (e: Exception) {
-            Log.w(TAG, "onWatchProgress: không parse được data='$data' thành episodeId: ${e.message}")
+            logW(TAG) { "onWatchProgress: không parse được data='$data' thành episodeId: ${e.message}" }
             null
         } ?: return
 
@@ -267,7 +282,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             }
         }, onError = { e ->
             // Best effort: lỗi mạng/token không được làm gián đoạn playback.
-            Log.w(TAG, "onWatchProgress: LỖI episodeId=$resolvedEpisodeId: ${e.message}")
+            logW(TAG) { "onWatchProgress: LỖI episodeId=$resolvedEpisodeId: ${e.message}" }
         })
     }
 
@@ -298,7 +313,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         val headers = getAuthHeaders(forceRefresh = forceRefresh, staleToken = staleToken)
         val currentToken = headers["Authorization"]?.removePrefix("Bearer ")
         if (currentToken == null) {
-            Log.d(TAG, "postWatchProgress: SKIPPED (chưa đăng nhập / không lấy được token) episodeId=$episodeId")
+            logD(TAG) { "postWatchProgress: SKIPPED (chưa đăng nhập / không lấy được token) episodeId=$episodeId" }
             return
         }
 
@@ -338,7 +353,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         val looksStale = !forceRefresh &&
             (response.code == 401 || looksExpiredOrUnauthorized(response.text))
         if (looksStale) {
-            Log.w(TAG, "postWatchProgress: episodeId=$episodeId token hết hạn (code=${response.code}), thử đăng nhập lại rồi retry 1 lần")
+            logW(TAG) { "postWatchProgress: episodeId=$episodeId token hết hạn (code=${response.code}), thử đăng nhập lại rồi retry 1 lần" }
             postWatchProgress(episodeId, progressSeconds, forceRefresh = true, staleToken = currentToken)
             return
         }
@@ -498,29 +513,29 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         if (!forceRefresh) {
             val existing = cachedToken
             if (!existing.isNullOrBlank()) {
-                Log.d(TAG, "ensureToken: dùng token đã cache (forceRefresh=false)")
+                logD(TAG) { "ensureToken: dùng token đã cache (forceRefresh=false)" }
                 return existing
             }
         }
 
-        Log.d(TAG, "ensureToken: cần lấy token mới (forceRefresh=$forceRefresh), chờ tokenMutex")
+        logD(TAG) { "ensureToken: cần lấy token mới (forceRefresh=$forceRefresh), chờ tokenMutex" }
         // Mutex tránh trường hợp nhiều coroutine (vd. loadLinks chạy song song cho
         // nhiều episodeId) cùng phát hiện token hết hạn và spam login song song.
         return tokenMutex.withLock {
-            Log.d(TAG, "ensureToken: đã giành được tokenMutex")
+            logD(TAG) { "ensureToken: đã giành được tokenMutex" }
             // Sau khi giành được lock, kiểm tra lại: có thể một coroutine khác đã
             // login lại thành công trong lúc chờ, nên không cần login lại lần nữa.
             val existing = cachedToken
             if (!forceRefresh) {
                 if (!existing.isNullOrBlank()) {
-                    Log.d(TAG, "ensureToken: token đã được coroutine khác cập nhật trong lúc chờ lock, dùng luôn")
+                    logD(TAG) { "ensureToken: token đã được coroutine khác cập nhật trong lúc chờ lock, dùng luôn" }
                     return@withLock existing
                 }
             } else if (!existing.isNullOrBlank() && existing != staleToken) {
                 // Một coroutine khác đã login lại thành công với token mới (khác với
                 // token mà caller này biết là đã hỏng) trong lúc chờ lock -> dùng luôn,
                 // không cần gọi /auth/login thêm lần nữa.
-                Log.d(TAG, "ensureToken: coroutine khác đã login lại thành công với token mới trong lúc chờ lock, bỏ qua login lại")
+                logD(TAG) { "ensureToken: coroutine khác đã login lại thành công với token mới trong lúc chờ lock, bỏ qua login lại" }
                 return@withLock existing
             }
 
@@ -528,12 +543,12 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             val password = prefs?.getString("anime47_password", "") ?: ""
 
             if (email.isBlank() || password.isBlank()) {
-                Log.w(TAG, "ensureToken: DỪNG - chưa cấu hình email/password trong Settings, không thể đăng nhập")
+                logW(TAG) { "ensureToken: DỪNG - chưa cấu hình email/password trong Settings, không thể đăng nhập" }
                 return@withLock null
             }
 
             try {
-                Log.d(TAG, "ensureToken: gọi POST $apiBaseUrl/auth/login cho email=$email")
+                logD(TAG) { "ensureToken: gọi POST $apiBaseUrl/auth/login cho email=$email" }
                 val body = toJson(LoginRequest(email, password))
                     .toRequestBody("application/json".toMediaTypeOrNull())
 
@@ -547,7 +562,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                     interceptor = interceptor,
                     timeout = 15000
                 )
-                Log.d(TAG, "ensureToken: /auth/login trả về HTTP code=${response.code} successful=${response.isSuccessful}")
+                logD(TAG) { "ensureToken: /auth/login trả về HTTP code=${response.code} successful=${response.isSuccessful}" }
 
                 val loginResponse: LoginResponse = mapper.readValue(
                     response.text,
@@ -556,7 +571,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 val newToken = loginResponse.access_token
                 if (!newToken.isNullOrBlank()) {
                     cachedToken = newToken
-                    Log.d(TAG, "ensureToken: login THÀNH CÔNG, đã cập nhật cachedToken (độ dài=${newToken.length})")
+                    logD(TAG) { "ensureToken: login THÀNH CÔNG, đã cập nhật cachedToken (độ dài=${newToken.length})" }
                 } else {
                     Log.e(TAG, "ensureToken: THẤT BẠI - /auth/login trả về access_token rỗng/null. Response 300 ký tự đầu: ${response.text.take(300)}")
                 }
@@ -575,7 +590,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         return if (token != null) {
             mapOf("Authorization" to "Bearer $token")
         } else {
-            Log.d(TAG, "getAuthHeaders: không có token khả dụng, trả về headers rỗng (request sẽ đi không kèm Authorization)")
+            logD(TAG) { "getAuthHeaders: không có token khả dụng, trả về headers rỗng (request sẽ đi không kèm Authorization)" }
             emptyMap()
         }
     }
@@ -589,7 +604,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
     }
 
     private suspend inline fun <reified T> fetchApi(url: String): T {
-        Log.d(TAG, "fetchApi: GET url=$url")
+        logD(TAG) { "fetchApi: GET url=$url" }
         val headers = getAuthHeaders()
         val firstResponse = try {
             app.get(
@@ -604,7 +619,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             Log.e(TAG, "fetchApi: THẤT BẠI - lỗi mạng khi GET url=$url: ${e.message}", e)
             throw e
         }
-        Log.d(TAG, "fetchApi: url=$url trả về HTTP code=${firstResponse.code} successful=${firstResponse.isSuccessful}")
+        logD(TAG) { "fetchApi: url=$url trả về HTTP code=${firstResponse.code} successful=${firstResponse.isSuccessful}" }
 
         var text = firstResponse.text
 
@@ -613,7 +628,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         // người dùng tự vào cài đặt đăng nhập lại.
         val looksStale = looksExpiredOrUnauthorized(text) || firstResponse.code == 401
         if (looksStale) {
-            Log.w(TAG, "fetchApi: url=$url phát hiện token hết hạn/không hợp lệ (code=${firstResponse.code}), thử đăng nhập lại rồi retry 1 lần")
+            logW(TAG) { "fetchApi: url=$url phát hiện token hết hạn/không hợp lệ (code=${firstResponse.code}), thử đăng nhập lại rồi retry 1 lần" }
             // SỬA LỖI (race condition): không còn "cachedToken = null" ở đây ngoài
             // mutex — thao tác này trước đây có thể vô tình xoá mất token mới mà một
             // coroutine khác vừa login lại thành công (xem ghi chú tại ensureToken()).
@@ -630,17 +645,17 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             // response gốc (text) là lựa chọn hợp lý duy nhất; looksExpiredOrUnauthorized()
             // bên dưới sẽ bắt lại và báo lỗi rõ ràng cho người dùng trong cả hai trường hợp.
             if (retryHeaders.containsKey("Authorization")) {
-                Log.d(TAG, "fetchApi: retry GET url=$url với token mới")
+                logD(TAG) { "fetchApi: retry GET url=$url với token mới" }
                 val retryResponse = app.get(
                     url,
                     headers = retryHeaders,
                     interceptor = interceptor,
                     timeout = 15000
                 )
-                Log.d(TAG, "fetchApi: retry url=$url trả về HTTP code=${retryResponse.code} successful=${retryResponse.isSuccessful}")
+                logD(TAG) { "fetchApi: retry url=$url trả về HTTP code=${retryResponse.code} successful=${retryResponse.isSuccessful}" }
                 text = retryResponse.text
             } else {
-                Log.w(TAG, "fetchApi: url=$url không retry được vì không lấy được token mới (chưa đăng nhập hoặc login lại thất bại)")
+                logW(TAG) { "fetchApi: url=$url không retry được vì không lấy được token mới (chưa đăng nhập hoặc login lại thất bại)" }
             }
         }
 
@@ -885,7 +900,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.d(TAG, "loadLinks: BẮT ĐẦU data=$data")
+        logD(TAG) { "loadLinks: BẮT ĐẦU data=$data" }
 
         val episodeIds: List<Int> = try {
             if (data.startsWith("[")) {
@@ -898,9 +913,9 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             return false
         }
 
-        Log.d(TAG, "loadLinks: episodeIds=$episodeIds")
+        logD(TAG) { "loadLinks: episodeIds=$episodeIds" }
         if (episodeIds.isEmpty()) {
-            Log.w(TAG, "loadLinks: DỪNG - episodeIds rỗng")
+            logW(TAG) { "loadLinks: DỪNG - episodeIds rỗng" }
             return false
         }
 
@@ -941,7 +956,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             }.awaitAll()
         }
 
-        Log.d(TAG, "loadLinks: KẾT THÚC - loaded=${loaded.get()} cho episodeIds=$episodeIds")
+        logD(TAG) { "loadLinks: KẾT THÚC - loaded=${loaded.get()} cho episodeIds=$episodeIds" }
         return loaded.get()
     }
 
@@ -961,7 +976,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         // do timeout gửi xuống, khiến coroutine (và bất kỳ awaitAll() con nào bên trong)
         // không dừng đúng lúc như kỳ vọng.
         catchNonCancellation({
-            Log.d(TAG, "loadEpisodeStreams: episodeId=$episodeId gọi watch-info API")
+            logD(TAG) { "loadEpisodeStreams: episodeId=$episodeId gọi watch-info API" }
             val watchResponse: ApiWatchResponse? =
                 fetchApi("$apiBaseUrl/anime/watch/episode/$episodeId?lang=vi")
             val streams = watchResponse?.streams
@@ -969,14 +984,14 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 Log.e(TAG, "loadEpisodeStreams: episodeId=$episodeId DỪNG - watch-info trả về null hoặc không có 'streams' (watchResponse=$watchResponse)")
                 return@catchNonCancellation
             }
-            Log.d(TAG, "loadEpisodeStreams: episodeId=$episodeId nhận được ${streams.size} stream(s): ${streams.map { it.server_name to it.player_type }}")
+            logD(TAG) { "loadEpisodeStreams: episodeId=$episodeId nhận được ${streams.size} stream(s): ${streams.map { it.server_name to it.player_type }}" }
 
             val episodeLoaded = coroutineScope {
                 streams.map { stream ->
                     async { loadSingleStream(stream, referer, loaded, subtitleCallback, callback) }
                 }.awaitAll().any { it }
             }
-            Log.d(TAG, "loadEpisodeStreams: episodeId=$episodeId hoàn tất, episodeLoaded=$episodeLoaded")
+            logD(TAG) { "loadEpisodeStreams: episodeId=$episodeId hoàn tất, episodeLoaded=$episodeLoaded" }
 
             // Báo "đã xem" lên hệ thống DCC chỉ khi thực sự lấy được ít nhất 1 link
             // phát cho episode này (tránh cộng điểm cho tập lỗi/rỗng).
@@ -1004,9 +1019,9 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val url = stream.url
-        Log.d(TAG, "loadSingleStream: server=${stream.server_name} player_type=${stream.player_type} url=$url")
+        logD(TAG) { "loadSingleStream: server=${stream.server_name} player_type=${stream.player_type} url=$url" }
         if (url == null || url.isBlank()) {
-            Log.w(TAG, "loadSingleStream: bỏ qua server=${stream.server_name} vì url rỗng/null")
+            logW(TAG) { "loadSingleStream: bỏ qua server=${stream.server_name} vì url rỗng/null" }
             return false
         }
 
@@ -1022,7 +1037,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         // chứa metadata mã hóa AES-CTR (xem HydraxExtractor.kt). Phải đi qua
         // HydraxExtractor + HydraxInterceptor thay vì coi url là m3u8 trực tiếp.
         if (HydraxExtractor.isHydraxUrl(url)) {
-            Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận diện là HY (Hydrax), gọi HydraxExtractor.getLinks")
+            logD(TAG) { "loadSingleStream: server=${stream.server_name} nhận diện là HY (Hydrax), gọi HydraxExtractor.getLinks" }
             // SỬA LỖI (structured concurrency): xem ghi chú tại catchNonCancellation() —
             // giữ nguyên tín hiệu hủy (timeout/sibling lỗi trong awaitAll) thay vì để
             // catch trần nuốt mất, đặc biệt quan trọng vì HydraxExtractor.getLinks() có
@@ -1036,7 +1051,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                     referer = referer
                 )
                 hydraxLinks.forEach { callback(it) }
-                Log.d(TAG, "loadSingleStream: server=${stream.server_name} HY trả về ${hydraxLinks.size} link")
+                logD(TAG) { "loadSingleStream: server=${stream.server_name} HY trả về ${hydraxLinks.size} link" }
                 hydraxLinks.isNotEmpty()
             }, onError = { e ->
                 Log.e(TAG, "loadSingleStream: server=${stream.server_name} HY LỖI: ${e.message}", e)
@@ -1049,7 +1064,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
 
         // Chấp nhận mọi server có URL hợp lệ (FE, HY, hoặc bất kỳ server nào khác),
         // thay vì chỉ giới hạn ở "FE"/jwplayer.
-        Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận diện là FE/khác (không phải HY), xử lý như m3u8 trực tiếp")
+        logD(TAG) { "loadSingleStream: server=${stream.server_name} nhận diện là FE/khác (không phải HY), xử lý như m3u8 trực tiếp" }
 
         // SỬA LỖI (root cause thật sự — đã xác nhận qua nhiều vòng chẩn đoán): trên
         // trình duyệt web, tập phim này phát FE bình thường; qua app lại nhận về ảnh
@@ -1083,10 +1098,10 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         if (url.contains("vlogphim.net")) {
             headers["Origin"] = referer
             headers["authority"] = runCatching { URL(url).host }.getOrDefault("pl.vlogphim.net")
-            Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận diện url vlogphim.net, thêm header Origin/authority")
+            logD(TAG) { "loadSingleStream: server=${stream.server_name} nhận diện url vlogphim.net, thêm header Origin/authority" }
         }
 
-        Log.d(TAG, "loadSingleStream: server=${stream.server_name} headers cuối cùng: $headers")
+        logD(TAG) { "loadSingleStream: server=${stream.server_name} headers cuối cùng: $headers" }
 
         // CHẨN ĐOÁN (log thực tế cho thấy ExoPlayer báo "Cannot find sync byte. Most
         // likely not a Transport Stream" khi phát link FE/vlogphim.net — tức nội dung
@@ -1098,6 +1113,15 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         // (m3u8 thật, JSON, HTML lỗi, hay định dạng khác) mà KHÔNG đổi hành vi callback
         // hiện tại (vẫn gửi link như cũ dù preflight thất bại, vì chưa rõ format thật
         // để tự ý xử lý khác).
+        // HIỆU NĂNG: trước đây "preflight.text" đọc TOÀN BỘ body response (m3u8 master
+        // playlist có thể dài, đặc biệt phim nhiều tập/nhiều bitrate liệt kê hết trong 1
+        // file) chỉ để lấy 200 ký tự đầu tiên cho mục đích debug/log. Với mục tiêu thật
+        // sự của preflight là lấy header Set-Cookie (không phụ thuộc body), việc buộc
+        // toàn bộ body phải tải xong trước khi loadLinks() có thể tiếp tục xử lý server
+        // tiếp theo/trả kết quả là chi phí mạng + độ trễ hoàn toàn không cần thiết. Đọc
+        // header trước, chỉ lấy 1 đoạn nhỏ ĐẦU body (đủ để chẩn đoán "#EXTM3U" hay
+        // không) qua peek() không tiêu thụ toàn bộ stream, rồi đóng response ngay -
+        // không có lý do gì để giữ kết nối mở/đọc hết phần còn lại của playlist.
         catchNonCancellation({
             val preflight = app.get(
                 url,
@@ -1106,10 +1130,26 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 timeout = 10000
             )
             val contentType = preflight.headers["Content-Type"] ?: preflight.headers["content-type"]
-            val bodyPreview = runCatching { preflight.text.take(200) }.getOrDefault("<không đọc được dạng text, có thể là binary>")
-            Log.d(TAG, "loadSingleStream: server=${stream.server_name} PREFLIGHT url=$url -> HTTP code=${preflight.code} Content-Type=$contentType, 200 ký tự đầu: $bodyPreview")
+            val bodyPreview = runCatching {
+                val body = preflight.okhttpResponse.body
+                if (body == null) {
+                    "<không có body>"
+                } else {
+                    val peeked = body.source().peek()
+                    val previewBuffer = Buffer()
+                    var read = 0L
+                    while (read < 200L) {
+                        val n = peeked.read(previewBuffer, 200L - read)
+                        if (n == -1L) break
+                        read += n
+                    }
+                    runCatching { previewBuffer.readString(Charsets.UTF_8) }
+                        .getOrDefault("<không decode được UTF-8, có thể là binary>")
+                }
+            }.getOrDefault("<không đọc được dạng text, có thể là binary>")
+            logD(TAG) { "loadSingleStream: server=${stream.server_name} PREFLIGHT url=$url -> HTTP code=${preflight.code} Content-Type=$contentType, 200 ký tự đầu: $bodyPreview" }
             if (!bodyPreview.trimStart().startsWith("#EXTM3U")) {
-                Log.w(TAG, "loadSingleStream: server=${stream.server_name} PREFLIGHT CẢNH BÁO - response KHÔNG bắt đầu bằng '#EXTM3U', có thể không phải m3u8 hợp lệ -> nguy cơ player lỗi 'Cannot find sync byte'")
+                logW(TAG) { "loadSingleStream: server=${stream.server_name} PREFLIGHT CẢNH BÁO - response KHÔNG bắt đầu bằng '#EXTM3U', có thể không phải m3u8 hợp lệ -> nguy cơ player lỗi 'Cannot find sync byte'" }
             }
 
             // Gom toàn bộ Set-Cookie trả về (có thể nhiều dòng, mỗi dòng 1 cookie) thành
@@ -1124,17 +1164,17 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             }.getOrDefault(emptyList())
             if (setCookies.isNotEmpty()) {
                 cookieHeader = setCookies.joinToString("; ") { it.substringBefore(";") }
-                Log.d(TAG, "loadSingleStream: server=${stream.server_name} nhận được ${setCookies.size} Set-Cookie từ preflight -> cookieHeader=$cookieHeader")
+                logD(TAG) { "loadSingleStream: server=${stream.server_name} nhận được ${setCookies.size} Set-Cookie từ preflight -> cookieHeader=$cookieHeader" }
             } else {
-                Log.d(TAG, "loadSingleStream: server=${stream.server_name} preflight KHÔNG có Set-Cookie nào")
+                logD(TAG) { "loadSingleStream: server=${stream.server_name} preflight KHÔNG có Set-Cookie nào" }
             }
         }, onError = { e ->
-            Log.w(TAG, "loadSingleStream: server=${stream.server_name} PREFLIGHT LỖI khi kiểm tra url=$url: ${e.message}")
+            logW(TAG) { "loadSingleStream: server=${stream.server_name} PREFLIGHT LỖI khi kiểm tra url=$url: ${e.message}" }
         })
 
         if (cookieHeader != null) {
             headers["Cookie"] = cookieHeader as String
-            Log.d(TAG, "loadSingleStream: server=${stream.server_name} đã gắn header Cookie vào headers cuối cùng gửi cho player: $cookieHeader")
+            logD(TAG) { "loadSingleStream: server=${stream.server_name} đã gắn header Cookie vào headers cuối cùng gửi cho player: $cookieHeader" }
         }
 
         // SỬA LỖI (structured concurrency + thiếu log lỗi FE): trước đây đoạn này
@@ -1151,7 +1191,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 this.quality = Qualities.Unknown.value
             }
 
-            Log.d(TAG, "loadSingleStream: server=${stream.server_name} link M3U8 trực tiếp, gửi callback")
+            logD(TAG) { "loadSingleStream: server=${stream.server_name} link M3U8 trực tiếp, gửi callback" }
             callback(link)
             true
         }, onError = { e ->
@@ -1203,7 +1243,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             val requestHost = request.url.host
             val authorityHeader = request.header("authority")
             if (authorityHeader != null && !authorityHeader.equals(requestHost, ignoreCase = true)) {
-                Log.d(TAG, "getVideoInterceptor: request tới host=$requestHost nhưng header 'authority' đang trỏ sai sang '$authorityHeader' -> loại bỏ header authority/Origin lệch domain")
+                logD(TAG) { "getVideoInterceptor: request tới host=$requestHost nhưng header 'authority' đang trỏ sai sang '$authorityHeader' -> loại bỏ header authority/Origin lệch domain" }
                 request = request.newBuilder()
                     .removeHeader("authority")
                     .removeHeader("Origin")
@@ -1260,7 +1300,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             // Log 1 dòng ngắn cho MỌI request đi qua interceptor này (không lọc domain)
             // để luôn thấy được domain/host thật ExoPlayer đang gọi khi phát, tách biệt
             // khỏi khối xử lý "fix" bên dưới (vẫn chỉ chạy cho nonprofit.asia như cũ).
-            Log.d(TAG, "getVideoInterceptor: request qua đây -> host=${request.url.host} path=${request.url.encodedPath} HTTP code=${response.code} Content-Type=${response.header("Content-Type")}")
+            logD(TAG) { "getVideoInterceptor: request qua đây -> host=${request.url.host} path=${request.url.encodedPath} HTTP code=${response.code} Content-Type=${response.header("Content-Type")}" }
 
             // CHẨN ĐOÁN (nội dung thật của playlist): log ở trên chỉ cho biết HTTP code
             // và Content-Type từ HEADER — không đảm bảo BODY thật sự là m3u8 hợp lệ. Log
@@ -1282,12 +1322,12 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                         peekedSource.read(previewBuffer, 300L)
                         val previewText = runCatching { previewBuffer.readString(Charsets.UTF_8) }
                             .getOrDefault("<không decode được UTF-8, có thể là binary>")
-                        Log.d(TAG, "getVideoInterceptor: url=$requestUrl NỘI DUNG playlist (300 ký tự đầu): $previewText")
+                        logD(TAG) { "getVideoInterceptor: url=$requestUrl NỘI DUNG playlist (300 ký tự đầu): $previewText" }
                     } catch (e: Exception) {
-                        Log.w(TAG, "getVideoInterceptor: url=$requestUrl không peek được nội dung body: ${e.message}")
+                        logW(TAG) { "getVideoInterceptor: url=$requestUrl không peek được nội dung body: ${e.message}" }
                     }
                 } else {
-                    Log.w(TAG, "getVideoInterceptor: url=$requestUrl response.body() null, không có gì để peek")
+                    logW(TAG) { "getVideoInterceptor: url=$requestUrl response.body() null, không có gì để peek" }
                 }
             }
 
@@ -1312,12 +1352,12 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 return@Interceptor response
             }
 
-            Log.d(TAG, "getVideoInterceptor: nonprofit.asia CDN khớp regex, cdnHost=$cdnHost url=$requestUrl HTTP code=${response.code} Content-Type=${response.header("Content-Type")} Content-Length=${response.header("Content-Length")} thời gian proceed=${proceedMs}ms")
+            logD(TAG) { "getVideoInterceptor: nonprofit.asia CDN khớp regex, cdnHost=$cdnHost url=$requestUrl HTTP code=${response.code} Content-Type=${response.header("Content-Type")} Content-Length=${response.header("Content-Length")} thời gian proceed=${proceedMs}ms" }
             StreamHealthStats.recordCdnProceed(cdnHost, proceedMs)
 
             val body = response.body
             if (body == null) {
-                Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl response.body() null, trả nguyên response gốc")
+                logW(TAG) { "getVideoInterceptor: nonprofit.asia url=$requestUrl response.body() null, trả nguyên response gốc" }
                 return@Interceptor response
             }
 
@@ -1360,7 +1400,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                     // đây (còn phụ thuộc offset tìm được bên dưới có > 0 hay không) — chỉ
                     // log sự kiện để đối chiếu.
                     StreamHealthStats.peekShort.incrementAndGet()
-                    Log.w(TAG, "getVideoInterceptor: PEEK_SHORT cdnHost=$cdnHost url=$requestUrl chỉ peek được $peekedBytes/$TS_SYNC_PEEK_BYTES byte mong muốn (thiếu ${TS_SYNC_PEEK_BYTES - peekedBytes} byte) -> có thể segment ngắn hơn cửa sổ peek (bình thường) hoặc kết nối bị cắt giữa chừng (bất thường)")
+                    logW(TAG) { "getVideoInterceptor: PEEK_SHORT cdnHost=$cdnHost url=$requestUrl chỉ peek được $peekedBytes/$TS_SYNC_PEEK_BYTES byte mong muốn (thiếu ${TS_SYNC_PEEK_BYTES - peekedBytes} byte) -> có thể segment ngắn hơn cửa sổ peek (bình thường) hoặc kết nối bị cắt giữa chừng (bất thường)" }
                 }
                 val pngMagic = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
                 val hasPngMagic = peekedSnapshot.size >= pngMagic.size &&
@@ -1373,11 +1413,11 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                     // chế giấu file đã đổi, sớm hơn cả việc offset lệch khỏi 22610 (vì có
                     // thể vỏ bọc mới vẫn tình cờ có 0x47 lặp lại ở vị trí khác).
                     StreamHealthStats.badMagic.incrementAndGet()
-                    Log.w(TAG, "getVideoInterceptor: PEEK_BAD_MAGIC cdnHost=$cdnHost url=$requestUrl 8 byte đầu=[${(0 until minOf(8, peekedSnapshot.size)).joinToString(" ") { "%02x".format(peekedSnapshot[it]) }}] KHÔNG khớp magic header PNG chuẩn [89 50 4e 47 0d 0a 1a 0a] -> cơ chế vỏ bọc có thể đã thay đổi, cần kiểm tra lại")
+                    logW(TAG) { "getVideoInterceptor: PEEK_BAD_MAGIC cdnHost=$cdnHost url=$requestUrl 8 byte đầu=[${(0 until minOf(8, peekedSnapshot.size)).joinToString(" ") { "%02x".format(peekedSnapshot[it]) }}] KHÔNG khớp magic header PNG chuẩn [89 50 4e 47 0d 0a 1a 0a] -> cơ chế vỏ bọc có thể đã thay đổi, cần kiểm tra lại" }
                 }
 
                 val offset = findMpegTsOffset(headerBuffer.readByteArray())
-                Log.d(TAG, "getVideoInterceptor: nonprofit.asia cdnHost=$cdnHost url=$requestUrl đã peek $peekedBytes byte, 16 byte hex đầu=[$peekedHex], offset đồng bộ tìm được=$offset")
+                logD(TAG) { "getVideoInterceptor: nonprofit.asia cdnHost=$cdnHost url=$requestUrl đã peek $peekedBytes byte, 16 byte hex đầu=[$peekedHex], offset đồng bộ tìm được=$offset" }
                 StreamHealthStats.nonprofitSegments.incrementAndGet()
                 if (offset > 0) {
                     StreamHealthStats.offsetFoundFirstPeek.incrementAndGet()
@@ -1388,7 +1428,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                         // để biết CDN con nào đang lệch — nếu chỉ 1-2 CDN lệch trong khi các
                         // CDN khác vẫn đúng 22610, nhiều khả năng là CDN đó đang thử nghiệm
                         // cấu trúc mới trước khi áp dụng toàn bộ.
-                        Log.w(TAG, "getVideoInterceptor: OFFSET_MISMATCH cdnHost=$cdnHost url=$requestUrl offset=$offset KHÁC với offset mong đợi $EXPECTED_TS_OFFSET -> có thể CDN này đã đổi cấu trúc vỏ bọc PNG giả")
+                        logW(TAG) { "getVideoInterceptor: OFFSET_MISMATCH cdnHost=$cdnHost url=$requestUrl offset=$offset KHÁC với offset mong đợi $EXPECTED_TS_OFFSET -> có thể CDN này đã đổi cấu trúc vỏ bọc PNG giả" }
                     }
                 } else {
                     StreamHealthStats.offsetZero.incrementAndGet()
@@ -1425,7 +1465,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                         StreamHealthStats.cloudflareBlockSuspected.incrementAndGet()
                         Log.e(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl NGHI VẤN đây là TRANG CHẶN CLOUDFLARE giả dạng Content-Type image/png (tìm thấy chuỗi 'cloudflare'/'blocked'/'<html' trong $peekedBytes byte đầu) -> KHÔNG PHẢI segment video thật, cần xử lý challenge Cloudflare thay vì tìm sync-byte")
                     } else {
-                        Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl KHÔNG tìm thấy byte đồng bộ MPEG-TS (0x47) trong $peekedBytes byte đầu, cũng KHÔNG có dấu hiệu trang chặn Cloudflare -> thử fallback qua CloudflareKiller (WebView, fingerprint giống trình duyệt thật) để loại trừ khả năng TLS/HTTP fingerprinting")
+                        logW(TAG) { "getVideoInterceptor: nonprofit.asia url=$requestUrl KHÔNG tìm thấy byte đồng bộ MPEG-TS (0x47) trong $peekedBytes byte đầu, cũng KHÔNG có dấu hiệu trang chặn Cloudflare -> thử fallback qua CloudflareKiller (WebView, fingerprint giống trình duyệt thật) để loại trừ khả năng TLS/HTTP fingerprinting" }
                     }
 
                     // SỬA LỖI (fallback fingerprinting): đã xác nhận qua thực nghiệm rằng
@@ -1450,7 +1490,18 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                     if (!looksLikeCloudflareBlock) {
                         StreamHealthStats.fallbackTriggered.incrementAndGet()
                         val fallbackResult = runCatching {
-                            val fallbackClient = OkHttpClient()
+                            // HIỆU NĂNG: dùng client dùng chung cấp companion
+                            // (fallbackOkHttpClient) thay vì "OkHttpClient()" mới mỗi lần
+                            // fallback kích hoạt. Mỗi OkHttpClient là 1 connection pool +
+                            // dispatcher/thread pool RIÊNG — với CDN hay bị nghi ngờ
+                            // fingerprinting (tức fallback có thể kích hoạt lặp lại nhiều
+                            // lần trong 1 phiên phát, mỗi segment "khả nghi" một lần), tạo
+                            // client mới liên tục vừa tốn tài nguyên hệ thống (không tái sử
+                            // dụng được kết nối TCP/TLS đã thiết lập với cùng CDN) vừa có
+                            // thể làm rò rỉ thread nếu OkHttpClient cũ không được đóng đúng
+                            // cách (OkHttpClient không implement Closeable một cách bắt buộc
+                            // phải gọi).
+                            val fallbackClient = fallbackOkHttpClient
                             val fallbackReq = Request.Builder()
                                 .url(requestUrl)
                                 .header("Referer", request.header("Referer") ?: "")
@@ -1466,10 +1517,10 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                         if (fallbackBytes != null && fallbackBytes.isNotEmpty()) {
                             val fallbackOffset = findMpegTsOffset(fallbackBytes)
                             val fallbackHex = (0 until minOf(16, fallbackBytes.size)).joinToString(" ") { "%02x".format(fallbackBytes[it]) }
-                            Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback OkHttp thuần trả về ${fallbackBytes.size} byte, 16 byte hex đầu=[$fallbackHex], offset=$fallbackOffset")
+                            logD(TAG) { "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback OkHttp thuần trả về ${fallbackBytes.size} byte, 16 byte hex đầu=[$fallbackHex], offset=$fallbackOffset" }
                             if (fallbackOffset > 0) {
                                 StreamHealthStats.fallbackSucceeded.incrementAndGet()
-                                Log.d(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback THÀNH CÔNG, tìm thấy segment TS thật -> dùng nội dung fallback thay response gốc")
+                                logD(TAG) { "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback THÀNH CÔNG, tìm thấy segment TS thật -> dùng nội dung fallback thay response gốc" }
                                 val trimmed = fallbackBytes.copyOfRange(fallbackOffset, fallbackBytes.size)
                                 val fallbackBody = trimmed.toResponseBody(body.contentType())
                                 StreamHealthStats.totalProcessingMs.addAndGet(System.currentTimeMillis() - interceptorStartMs)
@@ -1477,11 +1528,11 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                                 return@Interceptor response.newBuilder().body(fallbackBody).build()
                             } else {
                                 StreamHealthStats.fallbackFailed.incrementAndGet()
-                                Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CŨNG không tìm được sync-byte -> đây thực sự là nội dung server trả về (không phải do fingerprinting), giữ nguyên response gốc")
+                                logW(TAG) { "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback CŨNG không tìm được sync-byte -> đây thực sự là nội dung server trả về (không phải do fingerprinting), giữ nguyên response gốc" }
                             }
                         } else {
                             StreamHealthStats.fallbackFailed.incrementAndGet()
-                            Log.w(TAG, "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback thất bại hoặc rỗng (${fallbackResult.exceptionOrNull()?.message}), giữ nguyên response gốc")
+                            logW(TAG) { "getVideoInterceptor: nonprofit.asia url=$requestUrl fallback thất bại hoặc rỗng (${fallbackResult.exceptionOrNull()?.message}), giữ nguyên response gốc" }
                         }
                     }
                 } else {
@@ -1506,7 +1557,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                         StreamHealthStats.offsetVerifyFailed.incrementAndGet()
                         Log.e(TAG, "getVideoInterceptor: OFFSET_VERIFY_FAILED cdnHost=$cdnHost url=$requestUrl sau khi skip($offset) byte đầu tiên = 0x${"%02x".format(verifyByte.toInt() and 0xFF)} (mong đợi 0x47) -> điểm cắt SAI, segment gửi cho player có thể bị lỗi/hỏng khung hình dù offset tìm được ban đầu > 0")
                     } else if (verifyByte == null) {
-                        Log.w(TAG, "getVideoInterceptor: OFFSET_VERIFY_EOF cdnHost=$cdnHost url=$requestUrl sau khi skip($offset) không còn byte nào để verify (source đã hết) -> offset có thể lớn hơn kích thước segment thật")
+                        logW(TAG) { "getVideoInterceptor: OFFSET_VERIFY_EOF cdnHost=$cdnHost url=$requestUrl sau khi skip($offset) không còn byte nào để verify (source đã hết) -> offset có thể lớn hơn kích thước segment thật" }
                     } else {
                         StreamHealthStats.offsetVerifyOk.incrementAndGet()
                     }
@@ -1535,7 +1586,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 StreamHealthStats.totalProcessingMs.addAndGet(System.currentTimeMillis() - interceptorStartMs)
                 StreamHealthStats.maybeLogSummary(TAG)
                 val totalMs = System.currentTimeMillis() - interceptorStartMs
-                Log.d(TAG, "getVideoInterceptor: THROUGHPUT cdnHost=$cdnHost offset=$offset contentLength=$fixedLength thời gian proceed=${proceedMs}ms tổng xử lý interceptor=${totalMs}ms")
+                logD(TAG) { "getVideoInterceptor: THROUGHPUT cdnHost=$cdnHost offset=$offset contentLength=$fixedLength thời gian proceed=${proceedMs}ms tổng xử lý interceptor=${totalMs}ms" }
                 responseBuilder.build()
             } catch (e: IOException) {
                 // Đọc/skip source thất bại giữa chừng (mạng gián đoạn): trả lỗi gốc cho
@@ -1566,6 +1617,16 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         // Biên dịch 1 lần duy nhất cho toàn bộ vòng đời class thay vì mỗi lần gọi
         // getVideoInterceptor().
         private val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
+
+        // HIỆU NĂNG: 1 OkHttpClient dùng chung cho toàn bộ vòng đời class, thay vì tạo
+        // mới mỗi lần fallback CDN kích hoạt bên trong getVideoInterceptor() — xem ghi
+        // chú đầy đủ tại điểm dùng. Có timeout tường minh để tránh 1 fallback request
+        // treo vô hạn chiếm giữ thread OkHttp đang xử lý response cho ExoPlayer.
+        private val fallbackOkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
 
         // SỬA LỖI (root cause thật sự: cửa sổ peek quá nhỏ, không phải TLS
         // fingerprinting): log thực tế cho thấy offset đồng bộ MPEG-TS thật của mọi
