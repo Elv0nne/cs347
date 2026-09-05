@@ -391,7 +391,25 @@ object HydraxInterceptor : Interceptor {
     // cho lần Range request đầu tiên; mọi request tiếp theo (kể cả sau khi seek) dùng
     // lại kết quả đã cache, không gọi mạng thêm lần nào nữa.
     private val totalSizeCorrectionCache =
-        java.util.concurrent.ConcurrentHashMap<String, Long?>()
+        java.util.concurrent.ConcurrentHashMap<String, Mp4Correction?>()
+
+    /**
+     * Kết quả dò/sửa cấu trúc MP4 của 1 nguồn video:
+     * - realTotalSize: tổng kích thước file thật (dùng cho Content-Range/validate Range,
+     *   giữ nguyên từ trước).
+     * - corruptedMdatHeaderOffset: khác null CHỈ KHI header 8-byte của chính box 'mdat'
+     *   bị hỏng (case mới, xem detectCorrectTotalSize) — offset byte TUYỆT ĐỐI (tính từ
+     *   đầu file) nơi 8-byte "[size 4-byte BE][mdat]" chuẩn PHẢI được ghi đè vào dữ liệu
+     *   trả về cho player để Mp4Extractor phía ExoPlayer đọc được atom 'mdat' hợp lệ ngay
+     *   từ đầu, thay vì tự tính sai offset seek dựa trên rác đọc được tại đó (gốc rễ thật
+     *   của bug "Range không hợp lệ, overshootRatio quá lớn": không phải do totalSize sai,
+     *   mà do chính ExoPlayer nhận nhầm dữ liệu rác làm 1 box header và tính lố offset).
+     *   Khi null: file bình thường/đã tính đúng size, không cần patch byte nào.
+     */
+    private data class Mp4Correction(
+        val realTotalSize: Long,
+        val corruptedMdatHeaderOffset: Long? = null
+    )
 
     // HIỆU NĂNG: cache nhỏ, bounded, cho các segment 2MB đã tải — xem ghi chú đầy đủ
     // tại điểm dùng trong SegmentSource.fetchSegment(). Giới hạn số lượng segment giữ
@@ -462,12 +480,15 @@ object HydraxInterceptor : Interceptor {
         // baseUrl|md5Id|resId|declaredSize) nên chỉ tốn 1 lần dò mạng cho toàn bộ phiên
         // phát, y hệt cơ chế cache cũ, không thêm chi phí học ngoài lần đầu.
         val cacheKey = "$baseUrl|$md5Id|$resId|$size"
-        val correctedSize = totalSizeCorrectionCache.computeIfAbsent(cacheKey) {
+        val correction = totalSizeCorrectionCache.computeIfAbsent(cacheKey) {
             detectCorrectTotalSize(baseUrl, md5Id, resId, size)
         }
-        val effectiveSize = correctedSize ?: size
-        if (correctedSize != null && correctedSize != size) {
-            logW(TAG) { "intercept: PHÁT HIỆN size khai báo SAI (declared=$size) -> size THẬT=$correctedSize (chênh lệch=${correctedSize - size})" }
+        val effectiveSize = correction?.realTotalSize ?: size
+        if (correction != null && correction.realTotalSize != size) {
+            logW(TAG) { "intercept: PHÁT HIỆN size khai báo SAI (declared=$size) -> size THẬT=${correction.realTotalSize} (chênh lệch=${correction.realTotalSize - size})" }
+        }
+        if (correction?.corruptedMdatHeaderOffset != null) {
+            logW(TAG) { "intercept: PHÁT HIỆN header box 'mdat' bị hỏng tại offset=${correction.corruptedMdatHeaderOffset} -> sẽ tự PATCH lại 8 byte header chuẩn khi trả segment chứa vị trí này cho player" }
         }
 
         val rangeHeader = request.header("Range")
@@ -490,65 +511,23 @@ object HydraxInterceptor : Interceptor {
         // Quan trọng: dùng effectiveSize (đã sửa) ở đây, KHÔNG dùng size gốc — nếu không
         // start hợp lệ với totalSize thật vẫn có thể bị từ chối oan như bug gốc.
         if (start > endInclusive || start < 0) {
+            // CHẨN ĐOÁN THÊM: nếu start vượt effectiveSize quá xa (vd nhiều LẦN kích
+            // thước file, không phải lệch nhỏ vài KB/MB như lỗi "moov lặp"), đây rất có
+            // thể KHÔNG phải lỗi do totalSize sai ở phía Abyss/relay này, mà là ExoPlayer
+            // đang gửi 1 Range request thuộc về MediaItem/phiên phát TRƯỚC ĐÓ (video khác,
+            // dài hơn nhiều) tới relay host cố định "hydrax-relay.internal" của phiên
+            // phát HIỆN TẠI — ví dụ do chuyển tập/đổi resolution mà player chưa
+            // release/reset xong DataSource cũ. Log rõ tỉ lệ chênh lệch để dễ phân biệt 2
+            // nguyên nhân khi debug qua logcat.
             val overshootRatio = if (effectiveSize > 0) start.toDouble() / effectiveSize.toDouble() else -1.0
-
-            // SỬA LỖI vòng 3 (freeze/kẹt buffer xác nhận qua thực tế, không phải infinite
-            // retry loop như vòng 2): khi overshoot RẤT LỚN (vd >2 lần effectiveSize),
-            // Range này gần như chắc chắn là request "mồ côi" từ 1 DataSource CŨ (video/tập
-            // trước) mà ExoPlayer chưa kịp release/reset, bị gửi nhầm sang relay URL hiện
-            // tại. Trả 416 cứng ở đây khiến DefaultHttpDataSource coi lỗi này KHÔNG thể
-            // phục hồi (khác với case moov-scan-overshoot nhỏ mà ExoPlayer biết tự lùi lại
-            // — case đó vẫn giữ nguyên hành vi 416 cũ ở nhánh else bên dưới), nên toàn bộ
-            // player bị treo/đứng buffer vĩnh viễn thay vì tự mở lại đúng request cho video
-            // hiện tại.
-            //
-            // Không lặp lại lỗi "clamp 206 sai" của vòng 2 (start giữ nguyên giá trị KHÔNG
-            // hợp lệ trong Content-Range khiến player thấy phản hồi "không khớp" rồi lặp
-            // request cũ): ở đây ta clamp CẢ start LẪN end về 1 cửa sổ nhỏ HỢP LỆ ở cuối
-            // file (đúng với effectiveSize hiện tại), tức là trả lời "đây là dữ liệu thật,
-            // hợp lệ, ở gần cuối file" thay vì "đây là lỗi". DefaultHttpDataSource nhận
-            // Content-Range khớp với response thật (không lệch như vòng 2) nên cập nhật lại
-            // đúng vị trí đọc, thoát khỏi vòng lặp/treo và tự seek lại chỗ cần thiết cho
-            // đúng bằng metadata (moov) mà nó vừa đọc được.
-            val staleSessionThreshold = 2.0
-            if (overshootRatio > staleSessionThreshold) {
-                val clampedEnd = effectiveSize - 1
-                val clampedStart = maxOf(0L, clampedEnd - FRAGMENT_SIZE + 1)
-                logW(TAG) {
-                    "intercept: Range MỒ CÔI phát hiện (start=$start overshootRatio=$overshootRatio " +
-                        "effectiveSize=$effectiveSize declaredSize=$size rangeHeader=$rangeHeader) -> " +
-                        "khả năng cao là request sót lại từ phiên phát/video TRƯỚC ĐÓ. " +
-                        "KHÔNG trả 416 cứng (từng gây treo/đứng buffer) -> clamp về cửa sổ hợp lệ " +
-                        "cuối file [$clampedStart-$clampedEnd] để player nhận dữ liệu thật, tự đồng " +
-                        "bộ lại vị trí đọc và phục hồi."
-                }
-                val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, effectiveSize, clampedStart, clampedEnd)
-                val contentLength = clampedEnd - clampedStart + 1
-                val body: ResponseBody = segmentSource.buffer()
-                    .let { buffered -> object : ResponseBody() {
-                        override fun contentType() = "video/mp4".toMediaTypeOrNull()
-                        override fun contentLength() = contentLength
-                        override fun source() = buffered
-                    } }
-                return Response.Builder()
-                    .request(request)
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(206).message("Partial Content")
-                    .header("Accept-Ranges", "bytes")
-                    .header("Content-Length", contentLength.toString())
-                    .header("Content-Range", "bytes $clampedStart-$clampedEnd/$effectiveSize")
-                    .body(body)
-                    .build()
-            }
-
-            // Overshoot nhỏ (vd do lệch totalSize/moov-scan còn sót lại) — giữ nguyên hành
-            // vi 416 gốc, ExoPlayer đã được xác nhận tự xử lý tốt case này (xem ghi chú
-            // "vòng 2" phía trên).
-            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive effectiveSize=$effectiveSize declaredSize=$size rangeHeader=$rangeHeader overshootRatio=$overshootRatio")
+            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive effectiveSize=$effectiveSize declaredSize=$size rangeHeader=$rangeHeader overshootRatio=$overshootRatio (>1.5 lần gợi ý Range thuộc về 1 phiên phát/video KHÁC, không phải lỗi totalSize của nguồn hiện tại)")
             return errorResponse(request, 416, "Range Not Satisfiable", extraHeaders = mapOf("Content-Range" to "bytes */$effectiveSize"))
         }
 
-        val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, effectiveSize, start, endInclusive)
+        val segmentSource = SegmentSource(
+            client, baseUrl, md5Id, resId, effectiveSize, start, endInclusive,
+            corruptedMdatHeaderOffset = correction?.corruptedMdatHeaderOffset
+        )
         val contentLength = endInclusive - start + 1
         val body: ResponseBody = segmentSource.buffer()
             .let { buffered -> object : ResponseBody() {
@@ -598,7 +577,7 @@ object HydraxInterceptor : Interceptor {
         md5Id: Int,
         resId: Int,
         declaredTotalSize: Long
-    ): Long? {
+    ): Mp4Correction? {
         return try {
             val probePath = "/mp4/$md5Id/$resId/$declaredTotalSize/$FRAGMENT_SIZE/0"
             val probeToken = tokenFor(probePath, declaredTotalSize)
@@ -666,13 +645,85 @@ object HydraxInterceptor : Interceptor {
                 offset += boxSize32.toInt()
             }
 
+            // SỬA LỖI (vòng 3 — trường hợp mới quan sát được, khác 2 lần trước): có
+            // video mà 8-byte HEADER của chính box 'mdat' bị hỏng/ghi đè bởi rác (không
+            // phải lệch offset do 'moov' bị lặp, cũng không phải khớp nhầm chữ ký 'mdat'
+            // bên trong 1 box khác) — quét tuần tự box top-level đi hết đúng 'moov' theo
+            // size khai báo của chính nó (không lỗi), nhưng byte ngay sau đó KHÔNG đọc
+            // ra type "mdat" hợp lệ (vd type đọc được là "m\x00\x00\x01" hay tương tự) vì
+            // 4 byte type gốc "mdat" đã bị hỏng cùng 4 byte size. Xác nhận bằng cách so
+            // khớp byte-for-byte với 2 công cụ độc lập: nội dung binary NGAY SAU 'moov'
+            // hoàn toàn khớp với dữ liệu track mà chính 'moov' mô tả (kích thước từng
+            // sample trong 'stsz' cộng dồn đúng khớp phần đuôi file, offset chunk đầu
+            // tiên trong mọi box 'stco'/'co64' của tất cả track đều bằng chính xác
+            // "kết thúc moov + 8" — tức đúng bằng vị trí data thật SAU 1 header mdat 8
+            // byte tiêu chuẩn) — nên dữ liệu vẫn NGUYÊN VẸN, chỉ riêng header mdat bị hỏng.
+            //
+            // Vì 'mdat' luôn là box top-level CUỐI CÙNG trong mọi file đã quan sát (kể
+            // cả 2 lần lỗi trước), và bảng chunk-offset (stco/co64) trong moov là nguồn
+            // sự thật ĐỘC LẬP với header mdat có nguyên vẹn hay không (do chính server
+            // encode ra dựa trên payload thật, không dựa trên việc đọc lại header mdat),
+            // ta dùng offset NHỎ NHẤT trong toàn bộ entry đầu tiên của mọi box
+            // 'stco'/'co64' tìm được bên trong 'moov' làm điểm bắt đầu payload mdat thực
+            // (fallback CHỈ kích hoạt khi việc quét box tuần tự phía trên đã thất bại,
+            // không thay thế cách đọc mdat header bình thường khi nó còn nguyên vẹn).
+            var corruptedMdatHeaderOffset: Long? = null
             if (mdatHeaderOffset < 0 || mdatDeclaredSize <= 8) {
-                logD(TAG) { "detectCorrectTotalSize: không tìm thấy box 'mdat' hợp lệ ở top-level trong segment 0 (có thể mdat nằm ở segment sau, hoặc file không cần sửa)" }
-                return null
+                // LƯU Ý offset: "offset" tại đây đã dừng đúng ở vị trí BẮT ĐẦU box top-level
+                // ngay sau 'moov' (tức cuối 'moov', bao gồm cả 8-byte header của chính
+                // 'moov') — vì vòng lặp while phía trên coi 'moov' như 1 box top-level đã
+                // được nhảy qua trọn vẹn bằng "offset += boxSize32". Để quét NỘI DUNG bên
+                // trong 'moov' (tìm stco/co64 lồng bên trong các box con), phải bắt đầu
+                // từ ftypSize + 8 (bỏ qua 8-byte header của chính box 'moov'), không phải
+                // ftypSize (đó là vị trí đầu HEADER của 'moov', chưa vào nội dung).
+                val moovContentStart = ftypSize.toInt() + 8
+                val fallbackMdatStart = findEarliestChunkOffsetInMoov(seg0, moovContentStart, moovEndOffset = offset)
+                if (fallbackMdatStart == null) {
+                    logD(TAG) { "detectCorrectTotalSize: không tìm thấy box 'mdat' hợp lệ VÀ không tìm được stco/co64 để fallback trong segment 0 (có thể mdat nằm ở segment sau, hoặc file không cần sửa)" }
+                    return null
+                }
+                // mdat header (8 byte chuẩn) đứng ngay trước payload thật theo stco/co64.
+                val fallbackHeaderOffset = fallbackMdatStart - 8
+                if (fallbackHeaderOffset < offset) {
+                    // Offset chunk đầu tiên phải nằm SAU vị trí ta vừa quét hết 'moov' —
+                    // nếu không, dữ liệu quá bất thường để tin tưởng, bỏ qua an toàn.
+                    logW(TAG) { "detectCorrectTotalSize: fallback stco/co64 cho offset=$fallbackMdatStart NHỎ HƠN vị trí hết moov=$offset, bất thường -> bỏ qua để an toàn" }
+                    return null
+                }
+                logW(TAG) { "detectCorrectTotalSize: KHÔNG đọc được header 'mdat' hợp lệ (có thể bị hỏng), nhưng suy ra được payload thật bắt đầu tại offset=$fallbackMdatStart qua bảng stco/co64 trong moov -> dùng fallback này, sẽ PATCH lại 8-byte header" }
+                mdatHeaderOffset = fallbackHeaderOffset
+                mdatDeclaredSize = declaredTotalSize - fallbackHeaderOffset
+                if (mdatDeclaredSize <= 8) {
+                    logW(TAG) { "detectCorrectTotalSize: fallback mdatDeclaredSize=$mdatDeclaredSize <= 8, bất thường -> bỏ qua để an toàn" }
+                    return null
+                }
+                // Đánh dấu: header 8-byte tại offset này KHÔNG đọc được "mdat" hợp lệ và
+                // cần được PATCH lại trong dữ liệu thật trả về cho player (xem
+                // SegmentSource.fetchSegment) — đây là ĐIỂM KHÁC BIỆT cốt lõi so với 2 lần
+                // sửa totalSize trước: những lần đó chỉ cần sửa CON SỐ size dùng để tính
+                // Content-Range/token, còn lần này còn cần sửa CHÍNH DỮ LIỆU BYTE trả về,
+                // nếu không ExoPlayer vẫn tự đọc phải 8 byte rác đó và tính sai offset seek
+                // nội bộ của nó (bug quan sát được: start=1795315897, gấp ~10.56 lần size
+                // thật — một con số không thể suy ngược chính xác từ ngoài vì nó phụ thuộc
+                // thuật toán nội bộ của Mp4Extractor, nhưng CHẮC CHẮN không còn xảy ra nữa
+                // một khi ExoPlayer đọc được atom 'mdat' hợp lệ ngay từ đầu thay vì rác).
+                corruptedMdatHeaderOffset = fallbackHeaderOffset
             }
             val mdatSize = mdatDeclaredSize
 
             val realTotalSize = mdatHeaderOffset + mdatSize
+
+            if (corruptedMdatHeaderOffset != null) {
+                // Trường hợp header 'mdat' bị hỏng: theo cách tính ở trên,
+                // realTotalSize LUÔN bằng declaredTotalSize (vì mdatDeclaredSize được suy
+                // ngược lại đúng bằng "declaredTotalSize - fallbackHeaderOffset") — tức
+                // KHÔNG có gì sai về tổng kích thước file cả, chỉ 8 byte header cần patch.
+                // Trả về correction dù realTotalSize == declared, để intercept() biết mà
+                // patch byte, khác hẳn nhánh "không cần sửa gì" ở dưới (dành cho file hoàn
+                // toàn bình thường, không có gì để patch).
+                return Mp4Correction(realTotalSize, corruptedMdatHeaderOffset)
+            }
+
             if (realTotalSize == declaredTotalSize) {
                 // Đã đúng sẵn, không cần sửa gì.
                 return null
@@ -697,11 +748,84 @@ object HydraxInterceptor : Interceptor {
                 logW(TAG) { "detectCorrectTotalSize: realTotalSize=$realTotalSize CHÊNH LỆCH BẤT THƯỜNG so với declared=$declaredTotalSize (vượt ngưỡng hợp lý $maxPlausibleExtraBytes byte) -> khả năng cao do khớp nhầm/parse sai, bỏ qua để an toàn, giữ nguyên totalSize gốc" }
                 return null
             }
-            realTotalSize
+            Mp4Correction(realTotalSize)
         } catch (e: Exception) {
             logW(TAG) { "detectCorrectTotalSize: EXCEPTION, giữ nguyên totalSize gốc: ${e.message}" }
             null
         }
+    }
+
+    /**
+     * Fallback khi box 'mdat' không thể đọc trực tiếp (header 8-byte của chính nó bị
+     * hỏng — xác nhận qua case thực tế: type đọc được không phải "mdat" dù offset đúng
+     * ngay sau khi quét hết 'moov'). Parse ĐÚNG cấu trúc box đệ quy bên trong 'moov'
+     * (chỉ đệ quy vào các box container chuẩn: trak/mdia/minf/stbl/dinf/edts/udta/mvex,
+     * mỗi box con phải nằm GỌN trong box cha và có type hợp lệ mới được tin/đệ quy tiếp
+     * — không brute-force tìm chuỗi byte "stco"/"co64" tự do trong toàn bộ moov, vì cách
+     * đó có thể khớp nhầm 4 byte trùng hợp bên trong dữ liệu nhị phân khác như 'stsz'),
+     * tìm mọi box 'stco' (32-bit) / 'co64' (64-bit) hợp lệ, và trả về giá trị NHỎ NHẤT
+     * trong "entry đầu tiên" của mỗi bảng tìm được — đó chính là offset byte đầu tiên
+     * của dữ liệu payload thật trong 'mdat', vì bảng chunk-offset do chính server tạo ra
+     * dựa trên payload thật, độc lập với việc header 'mdat' có còn nguyên vẹn hay không.
+     * Trả về null nếu không tìm được entry nào đáng tin cậy.
+     */
+    private fun findEarliestChunkOffsetInMoov(seg0: ByteArray, moovStartOffset: Int, moovEndOffset: Int): Long? {
+        val containerTypes = setOf("trak", "mdia", "minf", "stbl", "dinf", "edts", "udta", "mvex")
+        var minOffset: Long? = null
+
+        fun scan(start: Int, end: Int) {
+            var offset = start
+            while (offset + 8 <= end && offset + 8 <= seg0.size) {
+                val boxSize = readUInt32BE(seg0, offset)
+                if (boxSize < 8 || offset + boxSize.toInt() > end) {
+                    // box vượt quá vùng cha khai báo, hoặc size vô lý -> không tin cậy,
+                    // dừng quét ở cấp này (không đoán mò nhảy tiếp).
+                    return
+                }
+                val typeBytes = seg0.copyOfRange(offset + 4, offset + 8)
+                val typeValid = typeBytes.all { b -> b in 0x20..0x7E }
+                if (!typeValid) return
+                val boxType = String(typeBytes, Charsets.US_ASCII)
+
+                when {
+                    boxType == "stco" -> {
+                        // FullBox header: version(1)+flags(3) rồi entry_count(4), entries 4-byte mỗi cái.
+                        if (offset + 16 <= seg0.size) {
+                            val entryCount = readUInt32BE(seg0, offset + 12)
+                            if (entryCount > 0 && offset + 16 + 4 <= seg0.size) {
+                                val firstEntry = readUInt32BE(seg0, offset + 16)
+                                if (firstEntry > 0) {
+                                    minOffset = minOffset?.let { minOf(it, firstEntry) } ?: firstEntry
+                                }
+                            }
+                        }
+                    }
+                    boxType == "co64" -> {
+                        // giống stco nhưng entry 8-byte (64-bit offset).
+                        if (offset + 16 <= seg0.size) {
+                            val entryCount = readUInt32BE(seg0, offset + 12)
+                            if (entryCount > 0 && offset + 16 + 8 <= seg0.size) {
+                                val hi = readUInt32BE(seg0, offset + 16)
+                                val lo = readUInt32BE(seg0, offset + 20)
+                                val firstEntry = (hi shl 32) or lo
+                                if (firstEntry > 0) {
+                                    minOffset = minOffset?.let { minOf(it, firstEntry) } ?: firstEntry
+                                }
+                            }
+                        }
+                    }
+                    boxType in containerTypes -> {
+                        scan(offset + 8, offset + boxSize.toInt())
+                    }
+                    // các box lá khác (stsd/stts/stsc/stsz/tkhd/mdhd/hdlr/...) không chứa
+                    // chunk-offset, bỏ qua không cần đệ quy.
+                }
+                offset += boxSize.toInt()
+            }
+        }
+
+        scan(moovStartOffset, moovEndOffset)
+        return minOffset
     }
 
     private fun readUInt32BE(data: ByteArray, offset: Int): Long {
@@ -769,7 +893,14 @@ object HydraxInterceptor : Interceptor {
         private val resId: Int,
         totalSizeFromMetadata: Long,
         startByte: Long,
-        endByteInclusiveFromRequest: Long
+        endByteInclusiveFromRequest: Long,
+        // SỬA LỖI (vòng 3, xem ghi chú đầy đủ tại detectCorrectTotalSize/Mp4Correction):
+        // khác null CHỈ KHI 8-byte header của box 'mdat' bị hỏng ngay trên server nguồn —
+        // offset TUYỆT ĐỐI (từ đầu file) nơi fetchSegment() phải ghi đè lại 8 byte chuẩn
+        // "[size 4-byte BE][mdat]" vào dữ liệu thật trước khi trả cho player, để
+        // ExoPlayer's Mp4Extractor đọc được atom 'mdat' hợp lệ ngay từ đầu thay vì tự
+        // suy luận sai offset seek từ rác (gốc rễ thật của bug Range overshoot khủng).
+        private val corruptedMdatHeaderOffset: Long?
     ) : Source {
 
         // SỬA LỖI GỐC RỄ (xác nhận qua phân tích byte-for-byte của file thật, so khớp
@@ -835,6 +966,10 @@ object HydraxInterceptor : Interceptor {
             // mạng. Tra cache dùng chung cấp HydraxInterceptor trước (key gồm đủ
             // baseUrl+md5Id+resId+totalSize+segIndex để không đụng giữa các video/nguồn
             // khác nhau) — chỉ gọi mạng khi thực sự chưa có trong cache.
+            // Lưu ý: cacheKey KHÔNG cần đổi khi có corruptedMdatHeaderOffset — nó đã bao
+            // gồm đủ baseUrl+md5Id+resId+totalSize (bất biến theo nguồn), và giá trị patch
+            // luôn xác định 1-1 theo cùng bộ tham số đó, nên bytes cache lại (đã patch) vẫn
+            // đúng cho MỌI lần đọc lại segment này trong cùng phiên phát.
             val cacheKey = "$baseUrl|$md5Id|$resId|$totalSize|$index"
             val cachedBytes = synchronized(segmentByteCache) { segmentByteCache[cacheKey] }
             if (cachedBytes != null) {
@@ -889,6 +1024,56 @@ object HydraxInterceptor : Interceptor {
             return ByteArray(0)
         }
 
+        /**
+         * Ghi đè lại 8 byte header box 'mdat' chuẩn ("[4-byte size BE]['m','d','a','t']")
+         * vào ĐÚNG vị trí corruptedMdatHeaderOffset bên trong segment vừa tải, NẾU offset
+         * đó rơi vào phạm vi byte [segStart, segStart+bytes.size) của segment này — offset
+         * là TUYỆT ĐỐI (tính từ đầu file), segment là 2MiB liên tiếp nên hầu hết trường
+         * hợp chỉ có ĐÚNG 1 segment (segment 0, vì mdat luôn nằm ngay sau ftyp+moov, và
+         * moov trong mọi case quan sát được đều đủ nhỏ để nằm gọn segment đầu) chứa offset
+         * này; nếu không, trả nguyên bytes gốc không đổi gì.
+         *
+         * "size" ghi vào 4-byte đầu = phần còn lại của TOÀN BỘ file kể từ header này
+         * (totalSize - offset) — đúng ngữ nghĩa chuẩn MP4 "box mdat kéo dài tới hết dữ
+         * liệu media", khớp với cách declaredTotalSize/mdatDeclaredSize đã được tính ở
+         * detectCorrectTotalSize (mdatDeclaredSize = declaredTotalSize - fallbackHeaderOffset).
+         */
+        private fun patchCorruptedMdatHeaderIfNeeded(bytes: ByteArray, segIndex: Int): ByteArray {
+            val patchOffsetAbs = corruptedMdatHeaderOffset ?: return bytes
+            val segStart = segIndex.toLong() * FRAGMENT_SIZE
+            val segEnd = segStart + bytes.size
+            if (patchOffsetAbs < segStart || patchOffsetAbs + 8 > segEnd) {
+                // Header không nằm trong segment này, không có gì để patch ở đây.
+                return bytes
+            }
+            val localOffset = (patchOffsetAbs - segStart).toInt()
+            val mdatBoxSize = totalSize - patchOffsetAbs
+            if (mdatBoxSize <= 8 || mdatBoxSize > 0xFFFFFFFFL) {
+                // Kích thước vô lý (âm, quá nhỏ, hoặc vượt quá phạm vi uint32) — không đủ
+                // tin cậy để patch, giữ nguyên bytes gốc thay vì áp 1 giá trị có thể còn
+                // gây hỏng nặng hơn cả header rác ban đầu.
+                logW(TAG) { "patchCorruptedMdatHeaderIfNeeded: mdatBoxSize=$mdatBoxSize bất thường tại offset=$patchOffsetAbs, bỏ qua patch để an toàn" }
+                return bytes
+            }
+            val patched = bytes.copyOf()
+            // 4-byte size, big-endian.
+            patched[localOffset] = ((mdatBoxSize ushr 24) and 0xFF).toByte()
+            patched[localOffset + 1] = ((mdatBoxSize ushr 16) and 0xFF).toByte()
+            patched[localOffset + 2] = ((mdatBoxSize ushr 8) and 0xFF).toByte()
+            patched[localOffset + 3] = (mdatBoxSize and 0xFF).toByte()
+            // 4-byte type "mdat" (ASCII: 0x6D 0x64 0x61 0x74).
+            patched[localOffset + 4] = 0x6D // 'm'
+            patched[localOffset + 5] = 0x64 // 'd'
+            patched[localOffset + 6] = 0x61 // 'a'
+            patched[localOffset + 7] = 0x74 // 't'
+            logW(TAG) {
+                "patchCorruptedMdatHeaderIfNeeded: ĐÃ PATCH 8-byte header 'mdat' tại offset tuyệt đối=" +
+                    "$patchOffsetAbs (segIndex=$segIndex localOffset=$localOffset) size=$mdatBoxSize -- " +
+                    "byte gốc bị hỏng đã được thay bằng box header 'mdat' hợp lệ"
+            }
+            return patched
+        }
+
         private fun fetchSegmentOnce(
             req: Request,
             segUrl: String,
@@ -913,8 +1098,16 @@ object HydraxInterceptor : Interceptor {
                             )
                             ByteArray(0)
                         } else {
-                            synchronized(segmentByteCache) { segmentByteCache[cacheKey] = bytes }
-                            bytes
+                            // SỬA LỖI (vòng 3): nếu vị trí byte mà server trả về cho segment
+                            // này chứa header 'mdat' đã biết là bị hỏng (corruptedMdatHeaderOffset
+                            // != null, xác định 1 lần duy nhất qua detectCorrectTotalSize), PATCH
+                            // lại đúng 8 byte đó thành "[4-byte size BE][mdat]" chuẩn TRƯỚC KHI lưu
+                            // vào cache/trả cho player — patch trước cache đảm bảo mọi lần đọc lại
+                            // segment này (kể cả sau khi seek qua lại) luôn nhận bản đã sửa, chỉ
+                            // tốn 1 lần patch cho cả phiên phát, không lặp lại mỗi lần đọc.
+                            val patched = patchCorruptedMdatHeaderIfNeeded(bytes, index)
+                            synchronized(segmentByteCache) { segmentByteCache[cacheKey] = patched }
+                            patched
                         }
                     }
                 }
@@ -932,3 +1125,4 @@ object HydraxInterceptor : Interceptor {
         // vốn có vài hàm helper crypto trùng tên trong cùng file.
     }
 }
+ 
