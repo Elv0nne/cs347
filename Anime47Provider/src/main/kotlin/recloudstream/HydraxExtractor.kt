@@ -441,8 +441,37 @@ object HydraxInterceptor : Interceptor {
             return errorResponse(request, 500, "Missing relay parameters")
         }
 
+        // SỬA LỖI GỐC RỄ (bug mới phát hiện qua log thực tế: start=1795315897 vượt xa
+        // size=169987160 khai báo, không phải lệch nhỏ do khối moov như trước): trước
+        // đây interceptor VALIDATE Range dựa theo "size" (totalSize) NGUYÊN GỐC từ
+        // metadata NGAY TẠI ĐÂY, rồi CHỈ SAU ĐÓ mới tạo SegmentSource — và chính
+        // SegmentSource mới là nơi tự dò + sửa lại totalSize thật (detectCorrectTotalSize).
+        // Hệ quả: nếu totalSize thật LỚN HƠN NHIỀU so với "size" khai báo (không chỉ
+        // lệch đúng bằng độ dài 1 khối "moov" bị lặp, mà lệch cả trăm/nghìn lần), thì
+        // NGAY LẦN REQUEST ĐẦU TIÊN nhận response 206 với Content-Range trả về totalSize
+        // ĐÃ SỬA (lớn hơn) — nhưng URL relay mà ExoPlayer dùng để tạo request Range TIẾP
+        // THEO vẫn giữ nguyên "size" cũ (URL relay được build 1 lần, không tự cập nhật).
+        // ExoPlayer thấy resource thật dài hơn (qua Content-Range trước đó) nên seek tới
+        // 1 vị trí start hợp lệ với totalSize ĐÃ SỬA nhưng lại KHÔNG hợp lệ với "size" cũ
+        // trong URL -> validate ở đây luôn thất bại (416) dù thực ra start hoàn toàn hợp
+        // lệ với totalSize thật. Vì validate diễn ra TRƯỚC khi SegmentSource kịp sửa lại
+        // totalSize, video không bao giờ thoát khỏi vòng lặp lỗi này.
+        //
+        // Cách sửa: dò/tra cache totalSize THẬT ngay tại đây, TRƯỚC khi parse & validate
+        // Range — dùng chung "totalSizeCorrectionCache" (đã có sẵn, key theo
+        // baseUrl|md5Id|resId|declaredSize) nên chỉ tốn 1 lần dò mạng cho toàn bộ phiên
+        // phát, y hệt cơ chế cache cũ, không thêm chi phí học ngoài lần đầu.
+        val cacheKey = "$baseUrl|$md5Id|$resId|$size"
+        val correctedSize = totalSizeCorrectionCache.computeIfAbsent(cacheKey) {
+            detectCorrectTotalSize(baseUrl, md5Id, resId, size)
+        }
+        val effectiveSize = correctedSize ?: size
+        if (correctedSize != null && correctedSize != size) {
+            logW(TAG) { "intercept: PHÁT HIỆN size khai báo SAI (declared=$size) -> size THẬT=$correctedSize (chênh lệch=${correctedSize - size})" }
+        }
+
         val rangeHeader = request.header("Range")
-        val (start, endInclusive) = parseRange(rangeHeader, size)
+        val (start, endInclusive) = parseRange(rangeHeader, effectiveSize)
 
         // SỬA LỖI vòng 2 (xác nhận qua log thực tế mới nhất): bản CLAMP trước đó (trả
         // 206 với start bị kẹp về size-1) làm ExoPlayer LẶP VÔ HẠN thay vì crash: nó
@@ -457,12 +486,24 @@ object HydraxInterceptor : Interceptor {
         // vượt quá cuối file thật): 416 kèm "Content-Range: bytes */<size>" là tín hiệu
         // chuẩn RFC 7233 để client biết ngay kích thước thật của resource và tự dừng
         // scan/lùi lại, thay vì nhận 206 với dữ liệu ở vị trí "lạ" rồi bị bối rối.
+        //
+        // Quan trọng: dùng effectiveSize (đã sửa) ở đây, KHÔNG dùng size gốc — nếu không
+        // start hợp lệ với totalSize thật vẫn có thể bị từ chối oan như bug gốc.
         if (start > endInclusive || start < 0) {
-            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive size=$size rangeHeader=$rangeHeader")
-            return errorResponse(request, 416, "Range Not Satisfiable", extraHeaders = mapOf("Content-Range" to "bytes */$size"))
+            // CHẨN ĐOÁN THÊM: nếu start vượt effectiveSize quá xa (vd nhiều LẦN kích
+            // thước file, không phải lệch nhỏ vài KB/MB như lỗi "moov lặp"), đây rất có
+            // thể KHÔNG phải lỗi do totalSize sai ở phía Abyss/relay này, mà là ExoPlayer
+            // đang gửi 1 Range request thuộc về MediaItem/phiên phát TRƯỚC ĐÓ (video khác,
+            // dài hơn nhiều) tới relay host cố định "hydrax-relay.internal" của phiên
+            // phát HIỆN TẠI — ví dụ do chuyển tập/đổi resolution mà player chưa
+            // release/reset xong DataSource cũ. Log rõ tỉ lệ chênh lệch để dễ phân biệt 2
+            // nguyên nhân khi debug qua logcat.
+            val overshootRatio = if (effectiveSize > 0) start.toDouble() / effectiveSize.toDouble() else -1.0
+            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive effectiveSize=$effectiveSize declaredSize=$size rangeHeader=$rangeHeader overshootRatio=$overshootRatio (>1.5 lần gợi ý Range thuộc về 1 phiên phát/video KHÁC, không phải lỗi totalSize của nguồn hiện tại)")
+            return errorResponse(request, 416, "Range Not Satisfiable", extraHeaders = mapOf("Content-Range" to "bytes */$effectiveSize"))
         }
 
-        val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, size, start, endInclusive)
+        val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, effectiveSize, start, endInclusive)
         val contentLength = endInclusive - start + 1
         val body: ResponseBody = segmentSource.buffer()
             .let { buffered -> object : ResponseBody() {
@@ -480,7 +521,7 @@ object HydraxInterceptor : Interceptor {
 
         return if (rangeHeader != null) {
             builder.code(206).message("Partial Content")
-                .header("Content-Range", "bytes $start-$endInclusive/$size")
+                .header("Content-Range", "bytes $start-$endInclusive/$effectiveSize")
                 .build()
         } else {
             builder.code(200).message("OK").build()
@@ -493,6 +534,164 @@ object HydraxInterceptor : Interceptor {
         val start = match.groupValues[1].toLongOrNull() ?: 0L
         val end = match.groupValues[2].toLongOrNull() ?: (totalSize - 1)
         return start to minOf(end, totalSize - 1)
+    }
+
+    /**
+     * Tải segment 0 (chứa ftyp+moov, không phụ thuộc totalSize để giải mã vì baseUrl/
+     * md5Id/resId là cố định) bằng totalSize khai báo, quét tìm "mdat" thật trong đó,
+     * và trả về totalSize đã sửa. Trả về null nếu không tìm thấy dấu hiệu sai lệch
+     * (file bình thường, không cần sửa) hoặc nếu việc dò gặp lỗi bất kỳ — trong mọi
+     * trường hợp không chắc chắn, giữ nguyên totalSize gốc để không phá vỡ video vốn
+     * đã đúng.
+     *
+     * ĐÃ CHUYỂN từ SegmentSource lên cấp object: cần gọi được từ intercept() TRƯỚC KHI
+     * validate Range (xem ghi chú tại điểm gọi trong intercept()), chứ không chỉ từ
+     * bên trong SegmentSource sau khi Range đã (có thể bị từ chối oan) validate xong.
+     */
+    private fun detectCorrectTotalSize(
+        baseUrl: String,
+        md5Id: Int,
+        resId: Int,
+        declaredTotalSize: Long
+    ): Long? {
+        return try {
+            val probePath = "/mp4/$md5Id/$resId/$declaredTotalSize/$FRAGMENT_SIZE/0"
+            val probeToken = tokenFor(probePath, declaredTotalSize)
+            val probeUrl = "$baseUrl/sora/$declaredTotalSize/$probeToken"
+            val req = Request.Builder()
+                .url(probeUrl)
+                .header("Referer", "https://abysscdn.com/")
+                .build()
+            val seg0 = client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                resp.body?.bytes() ?: return null
+            }
+            if (seg0.size < 32) return null
+
+            val ftypSize = readUInt32BE(seg0, 0)
+            val ftypType = String(seg0, 4, 4, Charsets.US_ASCII)
+            if (ftypType != "ftyp" || ftypSize <= 0) return null
+
+            // SỬA LỖI (bug thứ 2 tái phát y hệt lần trước — cùng gốc "mdat/moov lệch",
+            // xác nhận qua log thực tế: realTotalSize bị thổi phồng gấp ~10.5 lần size
+            // khai báo, quá lớn để là lỗi "1 khối moov lặp" thật như lần đầu): thuật
+            // toán CŨ quét MÙ từng byte tìm chữ ký "mdat" trong TOÀN BỘ phần còn lại của
+            // buffer (kể cả bên trong nội dung box "moov" chưa được bỏ qua đúng cách) —
+            // dữ liệu nhị phân bên trong moov (bảng sample, metadata nén, thumbnail
+            // nhúng...) HOÀN TOÀN CÓ THỂ tình cờ chứa đúng 4 byte 'm','d','a','t' liền
+            // nhau ở 1 vị trí không phải box header thật. Khi khớp nhầm, 4 byte NGAY
+            // TRƯỚC đó bị đọc nhầm thành "kích thước mdat" dù thực ra là dữ liệu ngẫu
+            // nhiên khác — cộng với offset đó cho ra 1 "realTotalSize" hoàn toàn vô
+            // nghĩa (có thể lớn gấp nhiều lần file thật), sinh ra bug 416 y hệt vòng 1.
+            //
+            // Sửa: PARSE ĐÚNG cấu trúc box MP4 (size + type tuần tự tại top-level, nhảy
+            // đúng offset += size mỗi vòng) thay vì quét byte mù — bỏ qua toàn bộ box
+            // "moov" (và bất kỳ box nào khác không phải "mdat") theo ĐÚNG kích thước
+            // khai báo trong header của chính nó, chỉ dừng lại và tin tưởng khi gặp
+            // "mdat" ở ĐÚNG vị trí bắt đầu 1 box top-level — không còn khả năng khớp
+            // nhầm dữ liệu bên trong 1 box khác.
+            var offset = ftypSize.toInt()
+            var mdatHeaderOffset = -1
+            var mdatDeclaredSize = -1L
+            while (offset + 8 <= seg0.size) {
+                val boxSize32 = readUInt32BE(seg0, offset)
+                val boxType = String(seg0, offset + 4, 4, Charsets.US_ASCII)
+
+                if (boxType == "mdat") {
+                    mdatHeaderOffset = offset
+                    mdatDeclaredSize = boxSize32
+                    break
+                }
+
+                // box size == 0 nghĩa là "kéo dài tới hết file" (hiếm, thường chỉ dùng
+                // cho box cuối cùng) — không có "size" cố định để nhảy tiếp, dừng quét
+                // an toàn thay vì đoán mò.
+                if (boxSize32 <= 0) {
+                    logD(TAG) { "detectCorrectTotalSize: gặp box '$boxType' size=0/không hợp lệ tại offset=$offset, dừng quét an toàn" }
+                    break
+                }
+                // box size == 1 nghĩa là size thật nằm ở 8 byte tiếp theo (64-bit
+                // "largesize") — vượt phạm vi buffer 2MB một cách bất thường ở segment 0,
+                // không tin cậy để tiếp tục quét, dừng an toàn.
+                if (boxSize32 == 1L) {
+                    logD(TAG) { "detectCorrectTotalSize: box '$boxType' dùng largesize 64-bit tại offset=$offset, không hỗ trợ, dừng quét an toàn" }
+                    break
+                }
+
+                offset += boxSize32.toInt()
+            }
+
+            if (mdatHeaderOffset < 0 || mdatDeclaredSize <= 8) {
+                logD(TAG) { "detectCorrectTotalSize: không tìm thấy box 'mdat' hợp lệ ở top-level trong segment 0 (có thể mdat nằm ở segment sau, hoặc file không cần sửa)" }
+                return null
+            }
+            val mdatSize = mdatDeclaredSize
+
+            val realTotalSize = mdatHeaderOffset + mdatSize
+            if (realTotalSize == declaredTotalSize) {
+                // Đã đúng sẵn, không cần sửa gì.
+                return null
+            }
+            if (realTotalSize < declaredTotalSize) {
+                // Nhỏ hơn kích thước khai báo là bất thường/không tin cậy bằng trường hợp
+                // "thiếu đuôi" (lớn hơn) mà ta đã xác nhận qua thực nghiệm; bỏ qua để an toàn.
+                logW(TAG) { "detectCorrectTotalSize: realTotalSize=$realTotalSize < declared=$declaredTotalSize, bất thường -> bỏ qua, giữ nguyên" }
+                return null
+            }
+
+            // SANITY CHECK cuối (lớp phòng vệ thứ 2, độc lập với việc parse box đã sửa
+            // ở trên): độ lệch thật giữa "size" khai báo và totalSize thật, theo mọi
+            // trường hợp đã quan sát được (khối "moov" bị lặp/chèn nhầm), chỉ nằm trong
+            // khoảng vài trăm byte tới vài chục KB — KHÔNG BAO GIỜ lớn tới mức nhân đôi
+            // hay nhân 10 lần kích thước file. Nếu chênh lệch vượt xa mọi giá trị hợp lý
+            // (ví dụ do 1 edge-case parse box nào đó ở trên chưa lường hết), tốt hơn là
+            // KHÔNG tin kết quả và giữ nguyên totalSize gốc, thay vì áp dụng 1 con số có
+            // thể sai lệch nghiêm trọng hơn cả lỗi ban đầu.
+            val maxPlausibleExtraBytes = 1_000_000L // 1 MB dư ra là đã rất rộng rãi so với thực tế quan sát được
+            if (realTotalSize - declaredTotalSize > maxPlausibleExtraBytes) {
+                logW(TAG) { "detectCorrectTotalSize: realTotalSize=$realTotalSize CHÊNH LỆCH BẤT THƯỜNG so với declared=$declaredTotalSize (vượt ngưỡng hợp lý $maxPlausibleExtraBytes byte) -> khả năng cao do khớp nhầm/parse sai, bỏ qua để an toàn, giữ nguyên totalSize gốc" }
+                return null
+            }
+            realTotalSize
+        } catch (e: Exception) {
+            logW(TAG) { "detectCorrectTotalSize: EXCEPTION, giữ nguyên totalSize gốc: ${e.message}" }
+            null
+        }
+    }
+
+    private fun readUInt32BE(data: ByteArray, offset: Int): Long {
+        return ((data[offset].toLong() and 0xFF) shl 24) or
+            ((data[offset + 1].toLong() and 0xFF) shl 16) or
+            ((data[offset + 2].toLong() and 0xFF) shl 8) or
+            (data[offset + 3].toLong() and 0xFF)
+    }
+
+    private fun tokenFor(path: String, sizeForKey: Long): String {
+        val key = md5HexOfDigits(sizeForKey)
+        val encrypted = aesCtrEncryptToIso(path, key)
+        return doubleBase64(encrypted)
+    }
+
+    private fun md5HexOfDigits(value: Long): String {
+        val bytes = value.toString().map { c ->
+            if (c.isDigit()) c.digitToInt().toByte() else c.code.toByte()
+        }.toByteArray()
+        val digest = java.security.MessageDigest.getInstance("MD5").digest(bytes)
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun aesCtrEncryptToIso(data: String, keyHex: String): String {
+        val keyBytes = keyHex.toByteArray(Charsets.UTF_8)
+        val iv = keyBytes.copyOfRange(0, 16)
+        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(iv))
+        val encrypted = cipher.doFinal(data.toByteArray(Charsets.UTF_8))
+        return String(encrypted, Charsets.ISO_8859_1)
+    }
+
+    private fun doubleBase64(input: String): String {
+        val first = Base64.getEncoder().encodeToString(input.toByteArray(Charsets.ISO_8859_1)).replace("=", "")
+        return Base64.getEncoder().encodeToString(first.toByteArray()).replace("=", "")
     }
 
     private fun errorResponse(
@@ -536,114 +735,19 @@ object HydraxInterceptor : Interceptor {
         // được dùng làm KEY MÃ HÓA cho mọi token segment (kể cả segment 0), nó khiến
         // segment cuối cùng bị cắt cụt thiếu đúng phần đuôi "mdat" tương ứng — video
         // dừng đột ngột / ExoPlayer seek lố tay tới vị trí không tồn tại.
-        // Cách sửa: tải segment 0 bằng totalSize khai báo (metadata) như bình thường để
-        // lấy "moov", nhưng thay vì tin "moov"'s size field (cũng có thể lệch theo cùng
-        // lỗi), TỰ QUÉT tìm chữ ký "mdat" thật trong dữ liệu đã tải, đọc "size" ngay
-        // trước nó (được ghi bởi chính muxer, luôn đúng vì đây là box cuối cùng/duy nhất
-        // còn lại của file) để tính lại totalSize thật = mdatHeaderOffset + mdatSize.
-        // Toàn bộ phần còn lại (token, URL, Content-Length trả cho player) đều dùng
-        // totalSize ĐÃ SỬA này, không dùng con số gốc từ Abyss nữa.
-        private val totalSize: Long
-        private val endByteInclusive: Long
-
-        init {
-            // HIỆU NĂNG: xem ghi chú đầy đủ tại "totalSizeCorrectionCache" ở
-            // HydraxInterceptor. Key gồm đủ 4 tham số xác định DUY NHẤT 1 nguồn video cụ
-            // thể (baseUrl phụ thuộc sub-CDN, md5Id+resId xác định file, declaredTotalSize
-            // để tự làm mới cache nếu vì lý do nào đó metadata trả về totalSize khác cho
-            // cùng md5Id/resId, dù trường hợp này gần như không xảy ra trong thực tế).
-            // computeIfAbsent() của ConcurrentHashMap đảm bảo dò mạng chỉ chạy đúng 1 lần
-            // ngay cả khi nhiều Range request tới CÙNG segment 0 khởi tạo SegmentSource
-            // gần như đồng thời (vd. ExoPlayer mở nhiều luồng buffer song song lúc bắt
-            // đầu phát) — các request đến sau trong lúc đang dò sẽ đợi ngắn rồi nhận
-            // thẳng kết quả đã tính, không tự dò lại.
-            val cacheKey = "$baseUrl|$md5Id|$resId|$totalSizeFromMetadata"
-            val corrected = totalSizeCorrectionCache.computeIfAbsent(cacheKey) {
-                detectCorrectTotalSize(totalSizeFromMetadata)
-            }
-            if (corrected != null && corrected != totalSizeFromMetadata) {
-                logW(TAG) { "SegmentSource.init: PHÁT HIỆN totalSize từ metadata SAI (metadata=$totalSizeFromMetadata) -> totalSize THẬT=$corrected (chênh lệch=${corrected - totalSizeFromMetadata})" }
-                totalSize = corrected
-                // nếu endByteInclusive trước đó được tính dựa theo size sai (vd = size-1 cho request full),
-                // và nó khớp đúng với totalSizeFromMetadata-1 (nghĩa là player đang xin "toàn bộ file" theo
-                // hiểu biết CŨ), mở rộng nó ra đúng cuối file thật để không cắt mất phần đuôi.
-                endByteInclusive = if (endByteInclusiveFromRequest == totalSizeFromMetadata - 1) corrected - 1 else endByteInclusiveFromRequest
-            } else {
-                totalSize = totalSizeFromMetadata
-                endByteInclusive = endByteInclusiveFromRequest
-            }
-        }
+        //
+        // SỬA LỖI (vòng 3): việc dò + sửa totalSize (detectCorrectTotalSize) đã được
+        // CHUYỂN LÊN intercept() để chạy TRƯỚC KHI validate Range (xem ghi chú đầy đủ ở
+        // đó) — nếu không, request Range hợp lệ với totalSize thật vẫn có thể bị 416 oan
+        // vì validate cũ chạy trước khi SegmentSource kịp sửa lại totalSize. Do đó
+        // "totalSizeFromMetadata"/"endByteInclusiveFromRequest" nhận vào đây ĐÃ LÀ giá
+        // trị đúng (effectiveSize) do intercept() truyền xuống — không cần dò lại lần
+        // nữa ở đây, tránh gọi mạng trùng lặp.
+        private val totalSize: Long = totalSizeFromMetadata
+        private val endByteInclusive: Long = endByteInclusiveFromRequest
 
         private var currentPos = startByte
         private val currentBuffer = Buffer()
-
-        /**
-         * Tải segment 0 (chứa ftyp+moov, không phụ thuộc totalSize để giải mã vì baseUrl/
-         * md5Id/resId là cố định) bằng totalSize khai báo, quét tìm "mdat" thật trong đó,
-         * và trả về totalSize đã sửa. Trả về null nếu không tìm thấy dấu hiệu sai lệch
-         * (file bình thường, không cần sửa) hoặc nếu việc dò gặp lỗi bất kỳ — trong mọi
-         * trường hợp không chắc chắn, giữ nguyên totalSize gốc để không phá vỡ video vốn
-         * đã đúng.
-         */
-        private fun detectCorrectTotalSize(declaredTotalSize: Long): Long? {
-            return try {
-                val probePath = "/mp4/$md5Id/$resId/$declaredTotalSize/$FRAGMENT_SIZE/0"
-                val probeToken = tokenFor(probePath, declaredTotalSize)
-                val probeUrl = "$baseUrl/sora/$declaredTotalSize/$probeToken"
-                val req = Request.Builder()
-                    .url(probeUrl)
-                    .header("Referer", "https://abysscdn.com/")
-                    .build()
-                val seg0 = client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return null
-                    resp.body?.bytes() ?: return null
-                }
-                if (seg0.size < 32) return null
-
-                val ftypSize = readUInt32BE(seg0, 0)
-                val ftypType = String(seg0, 4, 4, Charsets.US_ASCII)
-                if (ftypType != "ftyp" || ftypSize <= 0) return null
-
-                // Quét TRỰC TIẾP tìm chữ ký "mdat" trong segment 0, KHÔNG tin vào bất kỳ
-                // box size nào đã đọc trước đó (moov's size field có thể cũng sai theo
-                // cùng lỗi) — đây là cách đáng tin cậy nhất, độc lập với mọi field khác.
-                val mdatSig = byteArrayOf('m'.code.toByte(), 'd'.code.toByte(), 'a'.code.toByte(), 't'.code.toByte())
-                var searchFrom = ftypSize.toInt()
-                var mdatTypeOffset = -1
-                while (searchFrom + 4 <= seg0.size) {
-                    var match = true
-                    for (k in 0..3) {
-                        if (seg0[searchFrom + k] != mdatSig[k]) { match = false; break }
-                    }
-                    if (match) { mdatTypeOffset = searchFrom; break }
-                    searchFrom++
-                }
-                if (mdatTypeOffset < 8) {
-                    logD(TAG) { "detectCorrectTotalSize: không tìm thấy 'mdat' trong segment 0 (có thể mdat nằm ở segment sau, hoặc file không cần sửa)" }
-                    return null
-                }
-
-                val mdatHeaderOffset = mdatTypeOffset - 4
-                val mdatSize = readUInt32BE(seg0, mdatHeaderOffset)
-                if (mdatSize <= 8) return null
-
-                val realTotalSize = mdatHeaderOffset + mdatSize
-                if (realTotalSize == declaredTotalSize) {
-                    // Đã đúng sẵn, không cần sửa gì.
-                    return null
-                }
-                if (realTotalSize < declaredTotalSize) {
-                    // Nhỏ hơn kích thước khai báo là bất thường/không tin cậy bằng trường hợp
-                    // "thiếu đuôi" (lớn hơn) mà ta đã xác nhận qua thực nghiệm; bỏ qua để an toàn.
-                    logW(TAG) { "detectCorrectTotalSize: realTotalSize=$realTotalSize < declared=$declaredTotalSize, bất thường -> bỏ qua, giữ nguyên" }
-                    return null
-                }
-                realTotalSize
-            } catch (e: Exception) {
-                logW(TAG) { "detectCorrectTotalSize: EXCEPTION, giữ nguyên totalSize gốc: ${e.message}" }
-                null
-            }
-        }
 
         override fun read(sink: Buffer, byteCount: Long): Long {
             if (currentPos > endByteInclusive) {
@@ -694,7 +798,7 @@ object HydraxInterceptor : Interceptor {
             }
 
             val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
-            val token = tokenFor(path, totalSize)
+            val token = HydraxInterceptor.tokenFor(path, totalSize)
             val segUrl = "$baseUrl/sora/$totalSize/$token"
             logD(TAG) { "fetchSegment: segIndex=$index md5Id=$md5Id resId=$resId totalSize=$totalSize url=$segUrl" }
             val req = Request.Builder()
@@ -720,40 +824,12 @@ object HydraxInterceptor : Interceptor {
             }.getOrDefault(ByteArray(0))
         }
 
-        private fun readUInt32BE(data: ByteArray, offset: Int): Long {
-            return ((data[offset].toLong() and 0xFF) shl 24) or
-                ((data[offset + 1].toLong() and 0xFF) shl 16) or
-                ((data[offset + 2].toLong() and 0xFF) shl 8) or
-                (data[offset + 3].toLong() and 0xFF)
-        }
-
-        private fun tokenFor(path: String, sizeForKey: Long): String {
-            val key = md5HexOfDigits(sizeForKey)
-            val encrypted = aesCtrEncryptToIso(path, key)
-            return doubleBase64(encrypted)
-        }
-
-        private fun md5HexOfDigits(value: Long): String {
-            val bytes = value.toString().map { c ->
-                if (c.isDigit()) c.digitToInt().toByte() else c.code.toByte()
-            }.toByteArray()
-            val digest = java.security.MessageDigest.getInstance("MD5").digest(bytes)
-            return digest.joinToString("") { "%02x".format(it) }
-        }
-
-        private fun aesCtrEncryptToIso(data: String, keyHex: String): String {
-            val keyBytes = keyHex.toByteArray(Charsets.UTF_8)
-            val iv = keyBytes.copyOfRange(0, 16)
-            val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(iv))
-            val encrypted = cipher.doFinal(data.toByteArray(Charsets.UTF_8))
-            return String(encrypted, Charsets.ISO_8859_1)
-        }
-
-        private fun doubleBase64(input: String): String {
-            val first = Base64.getEncoder().encodeToString(input.toByteArray(Charsets.ISO_8859_1)).replace("=", "")
-            return Base64.getEncoder().encodeToString(first.toByteArray()).replace("=", "")
-        }
+        // readUInt32BE / tokenFor / md5HexOfDigits / aesCtrEncryptToIso / doubleBase64
+        // đã được CHUYỂN LÊN cấp "object HydraxInterceptor" (xem phía trên, gần
+        // detectCorrectTotalSize) để intercept() cũng gọi được trước khi tạo
+        // SegmentSource. fetchSegment() ở trên gọi tường minh "HydraxInterceptor.tokenFor(...)"
+        // (qualify rõ tên object) thay vì gọi trơn "tokenFor(...)" như bản cũ, để tránh
+        // mọi nhập nhằng resolve tên giữa 2 object HydraxExtractor/HydraxInterceptor
+        // vốn có vài hàm helper crypto trùng tên trong cùng file.
     }
 }
- 
