@@ -490,16 +490,61 @@ object HydraxInterceptor : Interceptor {
         // Quan trọng: dùng effectiveSize (đã sửa) ở đây, KHÔNG dùng size gốc — nếu không
         // start hợp lệ với totalSize thật vẫn có thể bị từ chối oan như bug gốc.
         if (start > endInclusive || start < 0) {
-            // CHẨN ĐOÁN THÊM: nếu start vượt effectiveSize quá xa (vd nhiều LẦN kích
-            // thước file, không phải lệch nhỏ vài KB/MB như lỗi "moov lặp"), đây rất có
-            // thể KHÔNG phải lỗi do totalSize sai ở phía Abyss/relay này, mà là ExoPlayer
-            // đang gửi 1 Range request thuộc về MediaItem/phiên phát TRƯỚC ĐÓ (video khác,
-            // dài hơn nhiều) tới relay host cố định "hydrax-relay.internal" của phiên
-            // phát HIỆN TẠI — ví dụ do chuyển tập/đổi resolution mà player chưa
-            // release/reset xong DataSource cũ. Log rõ tỉ lệ chênh lệch để dễ phân biệt 2
-            // nguyên nhân khi debug qua logcat.
             val overshootRatio = if (effectiveSize > 0) start.toDouble() / effectiveSize.toDouble() else -1.0
-            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive effectiveSize=$effectiveSize declaredSize=$size rangeHeader=$rangeHeader overshootRatio=$overshootRatio (>1.5 lần gợi ý Range thuộc về 1 phiên phát/video KHÁC, không phải lỗi totalSize của nguồn hiện tại)")
+
+            // SỬA LỖI vòng 3 (freeze/kẹt buffer xác nhận qua thực tế, không phải infinite
+            // retry loop như vòng 2): khi overshoot RẤT LỚN (vd >2 lần effectiveSize),
+            // Range này gần như chắc chắn là request "mồ côi" từ 1 DataSource CŨ (video/tập
+            // trước) mà ExoPlayer chưa kịp release/reset, bị gửi nhầm sang relay URL hiện
+            // tại. Trả 416 cứng ở đây khiến DefaultHttpDataSource coi lỗi này KHÔNG thể
+            // phục hồi (khác với case moov-scan-overshoot nhỏ mà ExoPlayer biết tự lùi lại
+            // — case đó vẫn giữ nguyên hành vi 416 cũ ở nhánh else bên dưới), nên toàn bộ
+            // player bị treo/đứng buffer vĩnh viễn thay vì tự mở lại đúng request cho video
+            // hiện tại.
+            //
+            // Không lặp lại lỗi "clamp 206 sai" của vòng 2 (start giữ nguyên giá trị KHÔNG
+            // hợp lệ trong Content-Range khiến player thấy phản hồi "không khớp" rồi lặp
+            // request cũ): ở đây ta clamp CẢ start LẪN end về 1 cửa sổ nhỏ HỢP LỆ ở cuối
+            // file (đúng với effectiveSize hiện tại), tức là trả lời "đây là dữ liệu thật,
+            // hợp lệ, ở gần cuối file" thay vì "đây là lỗi". DefaultHttpDataSource nhận
+            // Content-Range khớp với response thật (không lệch như vòng 2) nên cập nhật lại
+            // đúng vị trí đọc, thoát khỏi vòng lặp/treo và tự seek lại chỗ cần thiết cho
+            // đúng bằng metadata (moov) mà nó vừa đọc được.
+            val staleSessionThreshold = 2.0
+            if (overshootRatio > staleSessionThreshold) {
+                val clampedEnd = effectiveSize - 1
+                val clampedStart = maxOf(0L, clampedEnd - FRAGMENT_SIZE + 1)
+                logW(TAG) {
+                    "intercept: Range MỒ CÔI phát hiện (start=$start overshootRatio=$overshootRatio " +
+                        "effectiveSize=$effectiveSize declaredSize=$size rangeHeader=$rangeHeader) -> " +
+                        "khả năng cao là request sót lại từ phiên phát/video TRƯỚC ĐÓ. " +
+                        "KHÔNG trả 416 cứng (từng gây treo/đứng buffer) -> clamp về cửa sổ hợp lệ " +
+                        "cuối file [$clampedStart-$clampedEnd] để player nhận dữ liệu thật, tự đồng " +
+                        "bộ lại vị trí đọc và phục hồi."
+                }
+                val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, effectiveSize, clampedStart, clampedEnd)
+                val contentLength = clampedEnd - clampedStart + 1
+                val body: ResponseBody = segmentSource.buffer()
+                    .let { buffered -> object : ResponseBody() {
+                        override fun contentType() = "video/mp4".toMediaTypeOrNull()
+                        override fun contentLength() = contentLength
+                        override fun source() = buffered
+                    } }
+                return Response.Builder()
+                    .request(request)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(206).message("Partial Content")
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Length", contentLength.toString())
+                    .header("Content-Range", "bytes $clampedStart-$clampedEnd/$effectiveSize")
+                    .body(body)
+                    .build()
+            }
+
+            // Overshoot nhỏ (vd do lệch totalSize/moov-scan còn sót lại) — giữ nguyên hành
+            // vi 416 gốc, ExoPlayer đã được xác nhận tự xử lý tốt case này (xem ghi chú
+            // "vòng 2" phía trên).
+            Log.e(TAG, "intercept: THẤT BẠI - range không hợp lệ start=$start endInclusive=$endInclusive effectiveSize=$effectiveSize declaredSize=$size rangeHeader=$rangeHeader overshootRatio=$overshootRatio")
             return errorResponse(request, 416, "Range Not Satisfiable", extraHeaders = mapOf("Content-Range" to "bytes */$effectiveSize"))
         }
 
