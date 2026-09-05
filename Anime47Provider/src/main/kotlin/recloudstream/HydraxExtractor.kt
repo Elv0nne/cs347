@@ -805,6 +805,52 @@ object HydraxInterceptor : Interceptor {
                 .url(segUrl)
                 .header("Referer", "https://abysscdn.com/")
                 .build()
+
+            // SỬA LỖI GỐC RỄ (cache-poisoning bởi segment bị cắt cụt): trước đây bytes
+            // tải về CHỈ cần "không rỗng" (bytes.isNotEmpty()) là được lưu VĨNH VIỄN vào
+            // segmentByteCache dùng chung cho cả phiên phát. Nếu 1 lần tải bị trục trặc
+            // mạng giữa chừng (CDN đóng kết nối sớm, đứt gói...) và chỉ nhận được VD.
+            // 64KB thay vì đủ kích thước segment thật (2MiB, hoặc phần đuôi ngắn hơn cho
+            // segment cuối), đoạn dữ liệu CỤT đó vẫn được coi là hợp lệ và bị cache lại
+            // — mọi Range request sau này (kể cả sau khi seek) trong SUỐT phần đời còn
+            // lại của cache entry đó đều đọc lại đúng bản CỤT này, làm lệch toàn bộ phép
+            // tính offset phía sau -> nội dung file (đặc biệt nếu rơi vào vùng 'moov')
+            // bị hỏng, có thể sinh ra các giá trị vô nghĩa (vd. bảng chunk-offset trỏ
+            // tới byte cách xa thực tế cả GB) mà ExoPlayer sau đó cố seek tới, gây đúng
+            // lỗi "Range không hợp lệ, overshootRatio quá lớn" quan sát được qua logcat.
+            //
+            // Sửa: tính trước độ dài ĐÚNG kỳ vọng của segment này (2MiB, trừ khi đây là
+            // segment CUỐI thì ngắn hơn theo phần dư thật của totalSize) và CHỈ cache +
+            // trả về bytes khi độ dài khớp chính xác. Nếu lệch, coi như tải thất bại
+            // (trả rỗng) — SegmentSource.read() đã có sẵn logic dừng stream an toàn cho
+            // trường hợp fetchSegment() trả rỗng, tốt hơn nhiều so với âm thầm phát tán
+            // dữ liệu cụt đi khắp phiên phát.
+            val segStart = index.toLong() * FRAGMENT_SIZE
+            val expectedLen = minOf(FRAGMENT_SIZE, totalSize - segStart)
+
+            // Cho phép 1 lần thử lại: giờ 1 lần tải bị cắt cụt do trục trặc mạng thoáng
+            // qua sẽ bị từ chối (không cache) thay vì âm thầm phát tán dữ liệu hỏng —
+            // nhưng nếu không thử lại, chỉ 1 lần chập chờn mạng cũng đủ làm dừng hẳn cả
+            // luồng phát (SegmentSource.read() trả -1 ngay khi fetchSegment rỗng). Thử
+            // lại 1 lần trước khi bỏ cuộc giúp việc "chặt chẽ hơn" ở trên không đánh đổi
+            // bằng trải nghiệm kém đi khi mạng chỉ giật nhẹ 1 nhịp.
+            repeat(2) { attempt ->
+                val result = fetchSegmentOnce(req, segUrl, index, expectedLen, cacheKey)
+                if (result.isNotEmpty()) return result
+                if (attempt == 0) {
+                    logW(TAG) { "fetchSegment: segIndex=$index thất bại lần 1, thử lại lần 2..." }
+                }
+            }
+            return ByteArray(0)
+        }
+
+        private fun fetchSegmentOnce(
+            req: Request,
+            segUrl: String,
+            index: Int,
+            expectedLen: Long,
+            cacheKey: String
+        ): ByteArray {
             return runCatching {
                 client.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) {
@@ -812,11 +858,19 @@ object HydraxInterceptor : Interceptor {
                         ByteArray(0)
                     } else {
                         val bytes = resp.body?.bytes() ?: ByteArray(0)
-                        logD(TAG) { "fetchSegment: segIndex=$index THÀNH CÔNG, nhận ${bytes.size} byte" }
-                        if (bytes.isNotEmpty()) {
+                        logD(TAG) { "fetchSegment: segIndex=$index THÀNH CÔNG, nhận ${bytes.size} byte (kỳ vọng $expectedLen byte)" }
+                        if (bytes.size.toLong() != expectedLen) {
+                            Log.e(
+                                TAG,
+                                "fetchSegment: segIndex=$index THẤT BẠI - nhận ${bytes.size} byte nhưng kỳ vọng " +
+                                    "$expectedLen byte (segment bị cắt cụt/thừa do trục trặc mạng) -> KHÔNG cache " +
+                                    "(tránh làm hỏng toàn bộ phiên phát), coi như tải thất bại lần này"
+                            )
+                            ByteArray(0)
+                        } else {
                             synchronized(segmentByteCache) { segmentByteCache[cacheKey] = bytes }
+                            bytes
                         }
-                        bytes
                     }
                 }
             }.onFailure { e ->
