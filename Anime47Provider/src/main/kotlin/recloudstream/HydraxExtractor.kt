@@ -675,6 +675,28 @@ object HydraxInterceptor : Interceptor {
             // (type mismatch: Long không tự gán được vào biến Int).
             var mdatHeaderOffset = -1L
             var mdatDeclaredSize = -1L
+            // SỬA LỖI GỐC RỄ (vòng 5 — nguyên nhân thật của "Range MỒ CÔI" lặp vô hạn
+            // tăng dần quan sát được qua log thực tế: start tăng đều đặn hàng tỷ byte
+            // mỗi request, KHÔNG BAO GIỜ dừng lại): vòng lặp quét box top-level trước
+            // đây chỉ kiểm tra "boxSize32 <= 0" và "boxSize32 == 1" là bất thường, rồi
+            // TIN TƯỞNG TUYỆT ĐỐI mọi giá trị dương khác để cộng dồn "offset +=
+            // boxSize32.toInt()" — kể cả khi giá trị đó (do chính segment 0 tải về bị
+            // hỏng/rác ở đúng vùng box, ví dụ header 'moov' bị ghi đè 1 phần) LỚN HƠN
+            // NHIỀU LẦN so với toàn bộ declaredTotalSize thật của file. Hệ quả xác nhận
+            // qua log: "offset" sau vòng lặp nhảy thẳng lên 1644591063 (~1.6GB) dù file
+            // khai báo chỉ 169987160 byte (~170MB) — offset này sau đó được dùng làm
+            // NGƯỠNG so sánh cho fallback stco/co64 (findEarliestChunkOffsetInMoov), làm
+            // fallback bị bác bỏ oan ("423902 NHỎ HƠN vị trí hết moov=1644591063") dù
+            // 423902 mới là offset ĐÚNG. Vì bị bác oan, hàm trả null -> không patch gì
+            // -> ExoPlayer nhận nguyên byte rác gốc, tự đọc ra 1 kích thước box khổng lồ
+            // và liên tục seek theo offset ngày càng xa để tìm "hết box" đó -> chính là
+            // chuỗi request Range tăng dần vô hạn quan sát được trong log thực tế.
+            //
+            // Sửa: mọi boxSize32 khiến offset mới VƯỢT QUÁ declaredTotalSize (không thể
+            // đúng — không box nào hợp lệ lại dài hơn cả file) hoặc vượt quá Int.MAX_VALUE
+            // một cách phi lý đều bị coi là DẤU HIỆU HỎNG, dừng quét ngay lập tức (giữ
+            // nguyên "offset" ở giá trị hợp lệ CUỐI CÙNG trước đó) thay vì cộng dồn giá
+            // trị rác vào offset rồi dùng nó cho các bước sau.
             while (offset + 8 <= seg0.size) {
                 val boxSize32 = readUInt32BE(seg0, offset)
                 val boxType = String(seg0, offset + 4, 4, Charsets.US_ASCII)
@@ -697,6 +719,22 @@ object HydraxInterceptor : Interceptor {
                 // không tin cậy để tiếp tục quét, dừng an toàn.
                 if (boxSize32 == 1L) {
                     logD(TAG) { "detectCorrectTotalSize: box '$boxType' dùng largesize 64-bit tại offset=$offset, không hỗ trợ, dừng quét an toàn" }
+                    break
+                }
+                // SANITY CHECK MỚI (chặn nguyên nhân gốc của bug): box size hợp lệ
+                // KHÔNG BAO GIỜ có thể đưa offset vượt quá kích thước file thật khai
+                // báo. Nếu xảy ra, box này (hoặc box header của nó) đã bị hỏng/đọc sai
+                // -- dừng quét ngay, KHÔNG cộng dồn giá trị rác vào offset, để nhánh
+                // fallback bên dưới còn cơ hội dùng đúng "offset" (vị trí cuối cùng còn
+                // tin cậy) làm ngưỡng so sánh.
+                val nextOffset = offset.toLong() + boxSize32
+                if (nextOffset > declaredTotalSize || nextOffset > Int.MAX_VALUE) {
+                    logW(TAG) {
+                        "detectCorrectTotalSize: box '$boxType' tại offset=$offset khai báo size=$boxSize32 " +
+                            "(-> offset kế tiếp=$nextOffset) VƯỢT QUÁ declaredTotalSize=$declaredTotalSize -> " +
+                            "box header này gần như chắc chắn bị hỏng/đọc sai, dừng quét an toàn TẠI ĐÂY " +
+                            "(giữ offset=$offset làm mốc tin cậy cuối cùng) thay vì cộng dồn giá trị rác"
+                    }
                     break
                 }
 
