@@ -1093,7 +1093,7 @@ object HydraxInterceptor : Interceptor {
                     // header tự sinh, KHÔNG gọi fetchSegment/CDN cho vùng này, và tuyệt
                     // đối KHÔNG ghi đè lên bất kỳ byte thật nào của server (khác hẳn cách
                     // làm SAI ở vòng 4 — patch tại chỗ làm mất dữ liệu NAL thật).
-                    val headerBytes = HydraxExtractor.buildMdatHeaderBytes(virtualTotalSize - insertAt)
+                    val headerBytes = buildMdatHeaderBytes(virtualTotalSize - insertAt)
                     val localOffset = (currentPos - insertAt).toInt()
                     currentBuffer.write(headerBytes, localOffset, headerBytes.size - localOffset)
                     logD(TAG) { "SegmentSource.read: currentPos=$currentPos nằm trong 8-byte mdat header ẢO [${insertAt}-${insertAt + 7}] -> trả header tự sinh, không đụng tới dữ liệu server" }
