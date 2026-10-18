@@ -223,7 +223,7 @@ object HydraxExtractor {
                 "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
             ),
             interceptor = cloudflareKiller,
-            timeout = 15000
+            timeout = 15
         )
         logD(TAG) { "fetchMp4Metadata: HTTP code=${response.code} successful=${response.isSuccessful}" }
         val html = response.text
