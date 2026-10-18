@@ -115,7 +115,59 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
     private val TAG = "Anime47Provider"
 
     override var mainUrl = "https://anime47.best"
-    private val apiBaseUrl = "https://anime47.love/api"
+    // Domain API hay đổi (anime47.love đã chết/không phản hồi -> app treo 120s rồi báo
+    // "Timed out waiting for 120000 ms"). Bản .cs3 chạy được dùng animevui.com làm domain
+    // mặc định, thử lần lượt các domain dự phòng, và nếu không domain nào dùng được thì
+    // tự dò từ file JS của site. Port lại từ bản dịch ngược Anime47_5.cs3.
+    private val apiBaseUrl = "https://animevui.com/api"
+    private val apiFallbacks = listOf("https://animevui.com/api")
+    @Volatile private var resolvedApiBase: String? = null
+
+    private suspend fun apiBase(): String {
+        resolvedApiBase?.let { return it }
+        for (base in apiFallbacks) {
+            if (probeApi(base)) {
+                Log.d(TAG, "API base = $base")
+                resolvedApiBase = base
+                return base
+            }
+        }
+        val detected = detectApiBaseFromSite()
+        val result = detected ?: apiBaseUrl
+        Log.d(TAG, "API base (tự dò từ site) = $result")
+        // Chỉ cache khi dò được; nếu không, lần sau thử lại thay vì kẹt vào domain chết.
+        if (detected != null) resolvedApiBase = detected
+        return result
+    }
+
+    private suspend fun probeApi(base: String): Boolean {
+        return try {
+            val txt = app.get(
+                "$base/anime/filter?lang=vi&page=1",
+                interceptor = interceptor,
+                timeout = 8
+            ).text
+            txt.contains("\"success\"") || txt.contains("\"data\"")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private suspend fun detectApiBaseFromSite(): String? {
+        return try {
+            val html = app.get(mainUrl, interceptor = interceptor, timeout = 15).text
+            val jsPath = Regex("/assets/[A-Za-z0-9._-]*[Aa]pi[A-Za-z0-9._-]*\\.js")
+                .find(html)?.value ?: return null
+            val js = app.get(mainUrl + jsPath, interceptor = interceptor, timeout = 15).text
+            Regex("https://[a-zA-Z0-9.-]+/api").find(js)?.value
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
     override var name = "Anime47"
     override val hasMainPage = true
     override var lang = "vi"
@@ -207,10 +259,10 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             if (!headers.containsKey("Authorization")) return // chưa đăng nhập, bỏ qua
 
             app.get(
-                "$apiBaseUrl/dcc/info",
+                "${apiBase()}/dcc/info",
                 headers = headers,
                 interceptor = interceptor,
-                timeout = 10000
+                timeout = 10
             )
         } catch (e: Exception) {
             // Không chặn luồng chính nếu điểm danh lỗi (mạng, token hết hạn, v.v.)
@@ -226,14 +278,14 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 .toRequestBody("application/json".toMediaTypeOrNull())
 
             app.post(
-                "$apiBaseUrl/profile/history/mark-episode",
+                "${apiBase()}/profile/history/mark-episode",
                 headers = headers + mapOf(
                     "origin" to mainUrl,
                     "referer" to "$mainUrl/"
                 ),
                 requestBody = body,
                 interceptor = interceptor,
-                timeout = 10000
+                timeout = 10
             )
         } catch (e: Exception) {
             // Best effort: không làm gián đoạn việc phát video nếu báo điểm thất bại
@@ -331,14 +383,14 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         ).toRequestBody("application/json".toMediaTypeOrNull())
 
         val response = app.post(
-            "$apiBaseUrl/dcc/watch-progress",
+            "${apiBase()}/dcc/watch-progress",
             headers = headers + mapOf(
                 "origin" to mainUrl,
                 "referer" to "$mainUrl/"
             ),
             requestBody = body,
             interceptor = interceptor,
-            timeout = 10000
+            timeout = 10
         )
 
         // SỬA LỖI (staleToken thiếu -> retry không thực sự login lại): truyền
@@ -548,19 +600,19 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             }
 
             try {
-                logD(TAG) { "ensureToken: gọi POST $apiBaseUrl/auth/login cho email=$email" }
+                logD(TAG) { "ensureToken: gọi POST $resolvedApiBase/auth/login cho email=$email" }
                 val body = toJson(LoginRequest(email, password))
                     .toRequestBody("application/json".toMediaTypeOrNull())
 
                 val response = app.post(
-                    "$apiBaseUrl/auth/login",
+                    "${apiBase()}/auth/login",
                     headers = mapOf(
                         "origin" to mainUrl,
                         "referer" to "$mainUrl/"
                     ),
                     requestBody = body,
                     interceptor = interceptor,
-                    timeout = 15000
+                    timeout = 15
                 )
                 logD(TAG) { "ensureToken: /auth/login trả về HTTP code=${response.code} successful=${response.isSuccessful}" }
 
@@ -611,7 +663,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 url,
                 headers = headers,
                 interceptor = interceptor,
-                timeout = 15000
+                timeout = 15
             )
         } catch (e: CancellationException) {
             throw e
@@ -650,7 +702,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                     url,
                     headers = retryHeaders,
                     interceptor = interceptor,
-                    timeout = 15000
+                    timeout = 15
                 )
                 logD(TAG) { "fetchApi: retry url=$url trả về HTTP code=${retryResponse.code} successful=${retryResponse.isSuccessful}" }
                 text = retryResponse.text
@@ -676,7 +728,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val url = "$apiBaseUrl${request.data}&page=$page"
+        val url = "${apiBase()}${request.data}&page=$page"
 
         // HIỆU NĂNG: trước đây "triggerDailyCheckinOnce()" được await() TUẦN TỰ trước
         // khi bắt đầu fetch nội dung trang chủ — dù bản thân hàm này đã "best effort"
@@ -713,10 +765,20 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         val posts = response?.data?.posts
             ?: throw ErrorLoadingException("Cấu trúc dữ liệu trang chủ đã thay đổi hoặc tài khoản chưa kích hoạt.")
 
+        // CHẨN ĐOÁN "trang trắng": trước đây nếu API trả về danh sách rỗng (thường do chưa
+        // đăng nhập, sai domain API, hoặc server đổi tham số lọc) thì app hiện trang trắng
+        // KHÔNG có lỗi, không biết nguyên nhân. Báo lỗi rõ ràng để người dùng thấy ngay.
+        if (posts.isEmpty()) {
+            throw ErrorLoadingException(
+                "Máy chủ Anime47 trả về danh sách rỗng (url=$url). " +
+                    "Hãy mở cài đặt tiện ích và đăng nhập tài khoản, hoặc kiểm tra lại domain API."
+            )
+        }
+
         val items = posts.mapNotNull { post ->
             val link = fixUrl(post.link) ?: return@mapNotNull null
             createSearchResponse(
-                post.title,
+                post.title ?: return@mapNotNull null,
                 post.poster,
                 link,
                 post.year?.toIntOrNull(),
@@ -724,12 +786,16 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             )
         }
 
+        if (items.isEmpty()) {
+            throw ErrorLoadingException("Có ${posts.size} mục nhưng không đọc được mục nào (thiếu title/link). Cấu trúc API có thể đã đổi.")
+        }
+
         return newHomePageResponse(request.name, items, items.size >= 24)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val url = "$apiBaseUrl/search/full/?lang=vi&keyword=$encoded&page=1"
+        val url = "${apiBase()}/search/full/?lang=vi&keyword=$encoded&page=1"
 
         // SỬA LỖI: tương tự getMainPage(), lỗi mạng thật sự trước đây bị nuốt im lặng
         // thành "không có kết quả" (emptyList()), khiến người dùng tưởng tìm kiếm không
@@ -778,10 +844,10 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         try {
             val (infoResponse, episodeResponse, recsResponse) = coroutineScope {
                 val infoTask = async {
-                    fetchApi<ApiDetailResponse>("$apiBaseUrl/anime/info/$animeId?lang=vi")
+                    fetchApi<ApiDetailResponse>("${apiBase()}/anime/info/$animeId?lang=vi")
                 }
                 val episodesTask = async {
-                    fetchApi<ApiEpisodeResponse>("$apiBaseUrl/anime/$animeId/episodes?lang=vi")
+                    fetchApi<ApiEpisodeResponse>("${apiBase()}/anime/$animeId/episodes?lang=vi")
                 }
                 // SỬA LỖI: "recommendations" chỉ là dữ liệu phụ (gợi ý phim liên quan),
                 // không thiết yếu để xem phim. Trước đây recsTask.await() nằm chung
@@ -801,7 +867,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 // không còn ý nghĩa gì hoàn tất trước khi thực sự ném lỗi ra ngoài.
                 val recsTask = async {
                     try {
-                        fetchApi<ApiRecommendationResponse>("$apiBaseUrl/anime/info/$animeId/recommendations?lang=vi")
+                        fetchApi<ApiRecommendationResponse>("${apiBase()}/anime/info/$animeId/recommendations?lang=vi")
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -978,7 +1044,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         catchNonCancellation({
             logD(TAG) { "loadEpisodeStreams: episodeId=$episodeId gọi watch-info API" }
             val watchResponse: ApiWatchResponse? =
-                fetchApi("$apiBaseUrl/anime/watch/episode/$episodeId?lang=vi")
+                fetchApi("${apiBase()}/anime/watch/episode/$episodeId?lang=vi")
             val streams = watchResponse?.streams
             if (streams == null) {
                 Log.e(TAG, "loadEpisodeStreams: episodeId=$episodeId DỪNG - watch-info trả về null hoặc không có 'streams' (watchResponse=$watchResponse)")
@@ -1127,7 +1193,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 url,
                 headers = headers,
                 interceptor = interceptor,
-                timeout = 10000
+                timeout = 10
             )
             val contentType = preflight.headers["Content-Type"] ?: preflight.headers["content-type"]
             val bodyPreview = runCatching {
@@ -1762,15 +1828,15 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
     )
 
     data class Post(
-        val id: Int,
-        val title: String,
-        val slug: String,
-        val link: String,
-        val poster: String?,
-        val episodes: String?,
-        val current_episode: String?,
-        val type: String?,
-        val year: String?
+        val id: Int? = null,
+        val title: String? = null,
+        val slug: String? = null,
+        val link: String? = null,
+        val poster: String? = null,
+        val episodes: String? = null,
+        val current_episode: String? = null,
+        val type: String? = null,
+        val year: String? = null
     )
 
     data class ApiFilterData(
@@ -1879,4 +1945,4 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         val results: List<SearchItem>?,
         val has_more: Boolean?
     )
-} 
+}
